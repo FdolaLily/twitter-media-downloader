@@ -3,13 +3,13 @@
 // @name:ja      Twitter/X メディアダウンローダー
 // @name:zh-CN   Twitter/X 媒体下载器
 // @name:zh-TW   Twitter/X 媒體下載器
-// @description        Download images/videos from Twitter/X; save animated GIFs as real GIF files with local conversion.
+// @description        Download Twitter/X media, save animated GIFs, and optionally convert videos up to 10 seconds to GIF locally.
 // @description:ja     Twitter/Xの画像や動画をワンクリックでダウンロード。カスタムファイル名や履歴に対応。
-// @description:zh-CN  一键下载 Twitter/X 图片、视频和 GIF 动图；动图在本地转换为真正的 GIF。
+// @description:zh-CN  下载 Twitter/X 图片、视频和 GIF 动图；支持将 10 秒以内的短视频在本地转为 GIF。
 // @description:zh-TW  一鍵下載 Twitter/X 圖片和影片，支援自訂檔名與下載歷史紀錄。
 // @author      ShanksSU
 // @namespace    https://github.com/ShanksSU/twitter-media-downloader
-// @version     0.3.2
+// @version     0.3.3
 // @match       https://twitter.com/*
 // @match       https://x.com/*
 // @icon        https://www.google.com/s2/favicons?sz=64&domain=x.com
@@ -34,6 +34,11 @@ class Config {
 
     static media_btn_css = `
         .tmd-down {margin-left: 12px; order: 99; position: relative;}
+        button.tmd-gif {align-self: center; border: 1px solid #536471; border-radius: 12px; padding: 3px 7px; background: transparent; color: #536471; font: bold 11px sans-serif; cursor: pointer;}
+        button.tmd-gif.tmd-media {right: 38px; top: 2px; background: #15202b; color: #fff;}
+        button.tmd-gif.completed {color: #00ba7c; border-color: #00ba7c;}
+        button.tmd-gif.failed {color: #f4212e; border-color: #f4212e;}
+        .tmd-notice {position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); z-index: 10001; max-width: 85vw; padding: 12px 18px; border-radius: 8px; background: #15202b; color: #fff; font: 14px sans-serif; box-shadow: 0 2px 12px #0005;}
         .tmd-down:hover > div > div > div > div {color: #FFD700;}
         .tmd-down:hover > div > div > div > div > div {background-color: rgba(255, 215, 0, 0.1);}
         .tmd-down:active > div > div > div > div > div {background-color: rgba(255, 215, 0, 0.2);}
@@ -1268,8 +1273,8 @@ class GifConverter {
     static maxBytes = 100 * 1024 * 1024;
     static tail = Promise.resolve();
 
-    static convert(url, progress) {
-        const job = this.tail.then(() => this.encode(url, progress));
+    static convert(url, progress, options = {}) {
+        const job = this.tail.then(() => this.encode(url, progress, options));
         this.tail = job.catch(() => {});
         return job;
     }
@@ -1293,7 +1298,16 @@ class GifConverter {
         });
     }
 
-    static async encode(url, progress = () => {}) {
+    static validateDuration(duration, maxSeconds = this.maxSeconds) {
+        if (!Number.isFinite(duration) || duration <= 0) {
+            throw new Error('GIF: invalid video duration / 无法读取视频时长');
+        }
+        if (duration > maxSeconds) {
+            throw new Error(`GIF: exceeds ${maxSeconds}s conversion limit / 仅支持 ${maxSeconds} 秒以内的视频`);
+        }
+    }
+
+    static async encode(url, progress = () => {}, options = {}) {
         progress('GIF ↓');
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 90000);
@@ -1310,6 +1324,7 @@ class GifConverter {
 
         const signature = await source.slice(0, 6).text();
         if (signature === 'GIF87a' || signature === 'GIF89a') {
+            if (options.requireVideo) throw new Error('GIF: expected a video source / 需要视频源文件');
             progress('GIF 100%');
             return new Blob([source], { type: 'image/gif' });
         }
@@ -1328,9 +1343,7 @@ class GifConverter {
             if (!Number.isFinite(duration) || duration <= 0 || !video.videoWidth || !video.videoHeight) {
                 throw new Error('GIF: invalid video metadata / 无效的视频信息');
             }
-            if (duration > this.maxSeconds) {
-                throw new Error(`GIF: exceeds ${this.maxSeconds}s conversion limit / 动图超过转换时长上限`);
-            }
+            this.validateDuration(duration, options.maxSeconds ?? this.maxSeconds);
             const scale = Math.min(1, this.maxSide / Math.max(video.videoWidth, video.videoHeight));
             canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
             canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
@@ -1403,7 +1416,7 @@ class DownloadQueue {
         try {
             let url = task.url;
             if (task.gif) {
-                const blob = await GifConverter.convert(url, task.onprogress);
+                const blob = await GifConverter.convert(url, task.onprogress, task.gifOptions);
                 bytes = blob.size;
                 objectUrl = URL.createObjectURL(blob);
                 url = objectUrl;
@@ -1446,6 +1459,34 @@ class UIManager {
             btn.classList.add(css);
         }
         if (title) btn.title = title;
+    }
+
+    addGifButton(downloadButton, run) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = document.documentElement.lang.startsWith('zh') ? '转 GIF' : 'GIF';
+        button.className = 'tmd-down tmd-gif download';
+        if (downloadButton.classList.contains('tmd-media')) button.classList.add('tmd-media');
+        button.title = document.documentElement.lang.startsWith('zh')
+            ? '短视频转 GIF（≤10 秒，无声音）' : 'Convert video to GIF (≤10 seconds, no audio)';
+        button.setAttribute('aria-label', button.title);
+        button.onclick = event => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (!button.classList.contains('loading')) run(button);
+        };
+        downloadButton.insertAdjacentElement('afterend', button);
+    }
+
+    showNotice(message) {
+        this.notice?.remove();
+        const notice = document.createElement('div');
+        notice.className = 'tmd-notice';
+        notice.setAttribute('role', 'status');
+        notice.textContent = message;
+        document.body.appendChild(notice);
+        this.notice = notice;
+        setTimeout(() => notice.remove(), 6000);
     }
 
     renderHistoryUI() {
@@ -1850,7 +1891,7 @@ class UIManager {
         let retweeter_name = '';
         let retweeter_id = '';
 
-        let media = article.querySelector(['a[href*="/photo/1"]', 'div[role="progressbar"]', 'button[data-testid="playButton"]', 'a[href="/settings/content_you_see"]', 'div.media-image-container', 'div.media-preview-container', 'div[aria-labelledby]>div:first-child>div[role="button"][tabindex="0"]'].join(','));
+        let media = article.querySelector(['video', '[data-testid="videoPlayer"]', 'a[href*="/photo/1"]', 'div[role="progressbar"]', 'button[data-testid="playButton"]', 'a[href="/settings/content_you_see"]', 'div.media-image-container', 'div.media-preview-container', 'div[aria-labelledby]>div:first-child>div[role="button"][tabindex="0"]'].join(','));
         if (media) {
             let status_id = article.querySelector('a[href*="/status/"]').href.split('/status/').pop().split('/').shift();
 
@@ -1880,6 +1921,9 @@ class UIManager {
             this.setButtonStatus(btn_down, is_exist ? 'exist' : 'download', is_exist ? this.lang.completed : this.lang.download);
 
             btn_share.parentNode.insertBefore(btn_down, btn_share.nextSibling);
+            this.addGifButton(btn_down, gifButton => this.app.handleDownloadClick(
+                gifButton, status_id, is_exist, null, retweeter_name, retweeter_id, { videoGif: true }
+            ));
             btn_down.onclick = () => {
                 this.app.handleDownloadClick(btn_down, status_id, is_exist, null, retweeter_name, retweeter_id);
 
@@ -1938,6 +1982,9 @@ class UIManager {
             this.setButtonStatus(btn_down, is_exist ? 'exist' : 'download', is_exist ? this.lang.completed : this.lang.download);
 
             li.appendChild(btn_down);
+            this.addGifButton(btn_down, gifButton => this.app.handleDownloadClick(
+                gifButton, status_id, is_exist, null, 'unknown', 'unknown', { videoGif: true }
+            ));
             btn_down.onclick = (e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -2000,7 +2047,7 @@ class TwitterMediaDownloaderApp {
         }))).observe(document.body, { childList: true, subtree: true });
     }
 
-    async handleDownloadClick(btn, status_id, is_exist, index, retweeter_name = 'unknown', retweeter_id = 'unknown') {
+    async handleDownloadClick(btn, status_id, is_exist, index, retweeter_name = 'unknown', retweeter_id = 'unknown', options = {}) {
         if (btn.classList.contains('loading')) return;
         this.ui.setButtonStatus(btn, 'loading');
 
@@ -2037,11 +2084,28 @@ class TwitterMediaDownloaderApp {
         };
 
         let medias = tweet.legacy.extended_entities?.media || [];
+        const allMedias = medias;
         info['media-count'] = medias.length;
 
         if (index) {
             let idx = parseInt(index, 10) - 1;
             medias = medias[idx] ? [medias[idx]] : [];
+        }
+
+        // This explicit action converts videos only; the original button still downloads MP4.
+        if (options.videoGif) {
+            medias = medias.filter(media => media.type === 'video');
+            let error;
+            if (!medias.length) {
+                error = 'No video to convert / 这条帖子没有可转换的普通视频';
+            } else if (medias.some(media => Number(media.video_info?.duration_millis) > 10000)) {
+                error = 'GIF: exceeds 10s conversion limit / 仅支持 10 秒以内的视频，请使用原下载按钮保存 MP4';
+            }
+            if (error) {
+                this.ui.setButtonStatus(btn, 'failed', error);
+                this.ui.showNotice(error);
+                return;
+            }
         }
 
         if (medias.length > 0) {
@@ -2053,9 +2117,10 @@ class TwitterMediaDownloaderApp {
             const baseInfo = { ...info };
             medias.forEach((media, i) => {
                 const info = { ...baseInfo };
-                const isGif = media.type === 'animated_gif';
+                const isVideoGif = options.videoGif && media.type === 'video';
+                const isGif = media.type === 'animated_gif' || Boolean(isVideoGif);
                 let mp4Variants = media.video_info?.variants?.filter(n => n.content_type === 'video/mp4') || [];
-                const gifVariant = isGif && media.video_info?.variants?.find(n => n.content_type === 'image/gif');
+                const gifVariant = media.type === 'animated_gif' && media.video_info?.variants?.find(n => n.content_type === 'image/gif');
                 info.url = media.type === 'photo'
                     ? media.media_url_https + ':orig'
                     : (gifVariant?.url || (mp4Variants.length > 0 ? mp4Variants.reduce((a, b) => (a.bitrate || 0) >= (b.bitrate || 0) ? a : b).url : (isGif ? null : media.video_info?.variants?.[0]?.url)));
@@ -2064,6 +2129,7 @@ class TwitterMediaDownloaderApp {
                     hasFailed = true;
                     tasksLeft--;
                     this.ui.setButtonStatus(btn, 'failed', 'NO_URL');
+                    if (options.videoGif) this.ui.showNotice('No MP4 source available / 未找到可转换的 MP4 视频源');
                     return;
                 }
 
@@ -2076,14 +2142,15 @@ class TwitterMediaDownloaderApp {
                 info.file = info.url.split('/').pop().split(/[:?]/)[0];
                 info['file-name'] = info.file.split('.')[0];
                 info['file-ext'] = isGif ? 'gif' : info.file.split('.').pop();
-                info['file-type'] = media.type.replace('animated_', '');
-                info.index = index ? index : (i + 1);
+                info['file-type'] = isGif ? 'gif' : media.type;
+                info.index = index ? index : allMedias.indexOf(media) + 1;
 
                 info.out = (out.replace(/\.?{file-ext}/, '') + ((medias.length > 1 || index) && !out.includes('{index}') && !out.includes('{file-name}') ? '-' + info.index : '') + '.{file-ext}')
                     .replace(/{([^{}:]+)(:[^{}]+)?}/g, (_, name) => info[name] != null ? info[name] : '');
 
                 this.queue.add({
                     url: info.url, name: info.out, gif: isGif,
+                    gifOptions: isVideoGif ? { maxSeconds: 10, requireVideo: true } : undefined,
                     onprogress: text => {
                         if (!hasFailed) {
                             btn.dataset.tmdProgress = text;
@@ -2115,6 +2182,7 @@ class TwitterMediaDownloaderApp {
                         tasksLeft--;
                         console.error('[TMD] Download failed', error);
                         this.ui.setButtonStatus(btn, 'failed', error?.message || error?.error || 'ERROR');
+                        if (options.videoGif) this.ui.showNotice(error?.message || error?.error || 'GIF conversion failed / GIF 转换失败');
                     }
                 });
             });

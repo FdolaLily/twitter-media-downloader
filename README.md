@@ -10,10 +10,22 @@ Copy the complete contents of `script.js` into the existing Tampermonkey script,
 save it, and refresh Twitter/X. Replacing the existing script preserves its settings
 and download history and avoids duplicate download buttons.
 
+## Short videos to GIF
+
+Use the separate **GIF** button beside the normal download button to convert ordinary
+videos up to and including 10 seconds. The normal button still downloads videos as MP4.
+The GIF action ignores photos in a mixed-media post and preserves the original media
+indexes in filenames. A post without ordinary videos shows a notice.
+
+The API duration is checked before downloading where available. The decoded video duration
+is always checked again before encoding, including when the API duration is absent or
+inaccurate. Videos over 10 seconds produce a visible notice; they are never truncated.
+GIF has no audio. Existing animated GIF downloads keep their separate 120-second limit.
+
 ## GIF downloads
 
-- Only `animated_gif` media enters the GIF conversion path. Photos and ordinary videos
-  retain their existing download formats.
+- The normal download button converts `animated_gif` media and keeps ordinary videos
+  as MP4. The separate GIF button explicitly converts short ordinary videos.
 - If a native GIF variant is available, its bytes are preserved.
 - MP4-backed animations are converted using the browser video decoder, Canvas, and
   the bundled [gifenc 1.0.3](https://github.com/mattdesl/gifenc) encoder. No conversion
@@ -58,3 +70,6 @@ Twitter/X page still needs manual verification after installation.
 动图会在本地转换为真正的 GIF，普通视频仍下载为 MP4；按钮会显示转换进度。
 默认最高约 15 帧/秒、最长边 640 像素，保留完整时长并循环播放。
 超过 120 秒或 100 MiB 限制时显示错误，不会截断动图或改存 MP4。
+
+新增“转 GIF”按钮：普通视频不超过 10 秒时可转换为无声音 GIF，原下载按钮仍保存 MP4。
+超过 10 秒会显示提示；没有接口时长也会读取实际视频时长后检查。
