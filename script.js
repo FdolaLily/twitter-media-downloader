@@ -9,7 +9,7 @@
 // @description:zh-TW  一鍵下載 Twitter/X 圖片和影片，支援自訂檔名與下載歷史紀錄。
 // @author      ShanksSU
 // @namespace    https://github.com/ShanksSU/twitter-media-downloader
-// @version     0.3.0
+// @version     0.3.4
 // @match       https://twitter.com/*
 // @match       https://x.com/*
 // @icon        https://www.google.com/s2/favicons?sz=64&domain=x.com
@@ -17,17 +17,22 @@
 // @grant       GM_getValue
 // @grant       GM_download
 // @grant       GM_addStyle
+// @grant       GM_xmlhttpRequest
+// @connect     pbs.twimg.com
+// @connect     video.twimg.com
 // @license     MIT
+// @downloadURL https://update.greasyfork.org/scripts/571423/TwitterX%20Media%20Downloader.user.js
+// @updateURL https://update.greasyfork.org/scripts/571423/TwitterX%20Media%20Downloader.meta.js
 // ==/UserScript==
 
 class Config {
     static AUTH_TOKEN = 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
     static defaultFilename = '{user-name}(@{user-id})_{index}';
     static language = {
-        en: { download: 'Download', completed: 'Download Completed', settings: 'Settings', history: 'Download Log', empty: 'No history yet.', unknown_date: 'Unknown Date', saved: 'Saved', dialog: { title: 'Download Settings', save: 'Save', save_history: 'Remember download history', auto_bookmark: 'Auto Bookmark on Download', clear_history: 'Clear All History', clear_confirm: 'Clear all download history?', pattern: 'File Name Pattern', preview: 'Preview:', empty_pattern: 'Pattern cannot be empty.', reset: '(Reset)', custom_mode: '(Custom Mode)', tag_mode: '(Tag Mode)', shortcut: 'Keyboard Shortcut:', tags: { '{user-name}': 'User Name', '{user-id}': 'User ID', '{status-id}': 'Tweet ID', '{date-time}': 'Time (UTC)', '{date-time-local}': 'Time (Local)', '{full-text}': 'Full Text', '{fav-count}': 'Likes', '{file-type}': 'Media Type', '{file-name}': 'Original Filename', '{media-count}': 'Media Count', '{index}': 'Index', '{rt-user-name}': 'RT User Name', '{rt-user-id}': 'RT User ID' } }, table: { thumb: 'Thumb', user: 'User', type: 'Type', size: 'Size', postTime: 'Post Time', downTime: 'Download Time', action: 'Action', go: 'Go', del: 'Delete' } },
-        ja: { download: 'ダウンロード', completed: 'ダウンロード完了', settings: '設定', history: 'ダウンロード履歴', empty: '履歴はありません。', unknown_date: '日付不明', saved: '保存しました', dialog: { title: 'ダウンロード設定', save: '保存', save_history: 'ダウンロード履歴を保存する', auto_bookmark: 'ダウンロード時に自動ブックマーク', clear_history: '履歴をクリア', clear_confirm: 'ダウンロード履歴を削除する？', pattern: 'ファイル名パターン', preview: 'プレビュー:', empty_pattern: 'パターンは空にできません。', reset: '(リセット)', custom_mode: '(カスタム)', tag_mode: '(タグモード)', shortcut: 'ショートカットキー:', tags: { '{user-name}': 'ユーザー名', '{user-id}': 'ユーザーID', '{status-id}': 'ツイートID', '{date-time}': '時間 (UTC)', '{date-time-local}': '時間 (ローカル)', '{full-text}': 'ツイート本文', '{fav-count}': 'いいね数', '{file-type}': 'メディア種類', '{file-name}': '元のファイル名', '{media-count}': 'メディア数', '{index}': 'インデックス', '{rt-user-name}': 'RT ユーザー名', '{rt-user-id}': 'RT ユーザーID' } }, table: { thumb: 'サムネ', user: 'ユーザー', type: '種類', size: 'サイズ', postTime: '投稿時間', downTime: '保存時間', action: 'アクション', go: '開く', del: '削除' } },
-        zh: { download: '下载', completed: '下载完成', settings: '设置', history: '下载记录', empty: '暂无记录。', unknown_date: '未知时间', saved: '已保存', dialog: { title: '下载设置', save: '保存', save_history: '保存下载记录', auto_bookmark: '下载时自动加入书签', clear_history: '(清除)', clear_confirm: '确认要清除下载记录？', pattern: '文件名格式', preview: '预览:', empty_pattern: '文件名格式不能为空。', reset: '(重置)', custom_mode: '(自订模式)', tag_mode: '(标签模式)', shortcut: '快捷键设定:', tags: { '{user-name}': '用户名称', '{user-id}': '用户账号', '{status-id}': '推文 ID', '{date-time}': '时间 (UTC)', '{date-time-local}': '时间 (本地)', '{full-text}': '推文內文', '{fav-count}': '点赞数', '{file-type}': '媒体类型', '{file-name}': '原始文件名', '{media-count}': '媒体总数', '{index}': '序号', '{rt-user-name}': '转帖者名称', '{rt-user-id}': '转帖者账号' } }, table: { thumb: '缩图', user: '用户', type: '类型', size: '大小', postTime: '贴文时间', downTime: '下载时间', action: '动作', go: '前往', del: '删除' } },
-        'zh-Hant': { download: '下載', completed: '下載完成', settings: '設置', history: '下載紀錄', empty: '暫無紀錄。', unknown_date: '未知時間', saved: '已保存', dialog: { title: '下載設置', save: '保存', save_history: '保存下載記錄', auto_bookmark: '下載時自動加入書籤', clear_history: '(清除)', clear_confirm: '確認要清除下載記錄？', pattern: '文件名規則', preview: '預覽:', empty_pattern: '文件名規則不能為空。', reset: '(重置)', custom_mode: '(自訂模式)', tag_mode: '(標籤模式)', shortcut: '快捷鍵設定:', tags: { '{user-name}': '使用者名稱', '{user-id}': '使用者帳號', '{status-id}': '推文 ID', '{date-time}': '時間 (UTC)', '{date-time-local}': '時間 (本地)', '{full-text}': '推文內文', '{fav-count}': '喜歡數量', '{file-type}': '媒體類型', '{file-name}': '原始檔名', '{media-count}': '媒體總數', '{index}': '排序序號', '{rt-user-name}': '轉推者名稱', '{rt-user-id}': '轉推者帳號' } }, table: { thumb: '縮圖', user: '用戶', type: '類型', size: '大小', postTime: '貼文時間', downTime: '下載時間', action: '動作', go: '前往', del: '刪除' } }
+        en: { download: 'Download', completed: 'Download Completed', settings: 'Settings', history: 'Download Log', empty: 'No history yet.', unknown_date: 'Unknown Date', saved: 'Saved', dialog: { title: 'Download Settings', save: 'Save', save_history: 'Remember download history', auto_bookmark: 'Auto Bookmark on Download', enable_shortcut: 'Enable Keyboard Shortcut', clear_history: 'Clear All History', clear_confirm: 'Clear all download history?', pattern: 'File Name Pattern', preview: 'Preview:', empty_pattern: 'Pattern cannot be empty.', reset: '(Reset)', custom_mode: '(Custom Mode)', tag_mode: '(Tag Mode)', shortcut: 'Keyboard Shortcut:', tags: { '{user-name}': 'User Name', '{user-id}': 'User ID', '{status-id}': 'Tweet ID', '{date-time}': 'Time (UTC)', '{date-time-local}': 'Time (Local)', '{full-text}': 'Full Text', '{fav-count}': 'Likes', '{file-type}': 'Media Type', '{file-name}': 'Original Filename', '{media-count}': 'Media Count', '{index}': 'Index', '{rt-user-name}': 'RT User Name', '{rt-user-id}': 'RT User ID' } }, table: { thumb: 'Thumb', user: 'User', type: 'Type', size: 'Size', postTime: 'Post Time', downTime: 'Download Time', action: 'Action', go: 'Go', del: 'Delete' } },
+        ja: { download: 'ダウンロード', completed: 'ダウンロード完了', settings: '設定', history: 'ダウンロード履歴', empty: '履歴はありません。', unknown_date: '日付不明', saved: '保存しました', dialog: { title: 'ダウンロード設定', save: '保存', save_history: 'ダウンロード履歴を保存する', auto_bookmark: 'ダウンロード時に自動ブックマーク', enable_shortcut: 'キーボードショートカットを有効にする', clear_history: '履歴をクリア', clear_confirm: 'ダウンロード履歴を削除する？', pattern: 'ファイル名パターン', preview: 'プレビュー:', empty_pattern: 'パターンは空にできません。', reset: '(リセット)', custom_mode: '(カスタム)', tag_mode: '(タグモード)', shortcut: 'ショートカットキー:', tags: { '{user-name}': 'ユーザー名', '{user-id}': 'ユーザーID', '{status-id}': 'ツイートID', '{date-time}': '時間 (UTC)', '{date-time-local}': '時間 (ローカル)', '{full-text}': 'ツイート本文', '{fav-count}': 'いいね数', '{file-type}': 'メディア種類', '{file-name}': '元のファイル名', '{media-count}': 'メディア数', '{index}': 'インデックス', '{rt-user-name}': 'RT ユーザー名', '{rt-user-id}': 'RT ユーザーID' } }, table: { thumb: 'サムネ', user: 'ユーザー', type: '種類', size: 'サイズ', postTime: '投稿時間', downTime: '保存時間', action: 'アクション', go: '開く', del: '削除' } },
+        zh: { download: '下载', completed: '下载完成', settings: '设置', history: '下载记录', empty: '暂无记录。', unknown_date: '未知时间', saved: '已保存', dialog: { title: '下载设置', save: '保存', save_history: '保存下载记录', auto_bookmark: '下载时自动加入书签', enable_shortcut: '启用快捷键', clear_history: '(清除)', clear_confirm: '确认要清除下载记录？', pattern: '文件名格式', preview: '预览:', empty_pattern: '文件名格式不能为空。', reset: '(重置)', custom_mode: '(自订模式)', tag_mode: '(标签模式)', shortcut: '快捷键设定:', tags: { '{user-name}': '用户名称', '{user-id}': '用户账号', '{status-id}': '推文 ID', '{date-time}': '时间 (UTC)', '{date-time-local}': '时间 (本地)', '{full-text}': '推文內文', '{fav-count}': '点赞数', '{file-type}': '媒体类型', '{file-name}': '原始文件名', '{media-count}': '媒体总数', '{index}': '序号', '{rt-user-name}': '转帖者名称', '{rt-user-id}': '转帖者账号' } }, table: { thumb: '缩图', user: '用户', type: '类型', size: '大小', postTime: '贴文时间', downTime: '下载时间', action: '动作', go: '前往', del: '删除' } },
+        'zh-Hant': { download: '下載', completed: '下載完成', settings: '設置', history: '下載紀錄', empty: '暫無紀錄。', unknown_date: '未知時間', saved: '已保存', dialog: { title: '下載設置', save: '保存', save_history: '保存下載記錄', auto_bookmark: '下載時自動加入書籤', enable_shortcut: '啟用快捷鍵', clear_history: '(清除)', clear_confirm: '確認要清除下載記錄？', pattern: '文件名規則', preview: '預覽:', empty_pattern: '文件名規則不能為空。', reset: '(重置)', custom_mode: '(自訂模式)', tag_mode: '(標籤模式)', shortcut: '快捷鍵設定:', tags: { '{user-name}': '使用者名稱', '{user-id}': '使用者帳號', '{status-id}': '推文 ID', '{date-time}': '時間 (UTC)', '{date-time-local}': '時間 (本地)', '{full-text}': '推文內文', '{fav-count}': '喜歡數量', '{file-type}': '媒體類型', '{file-name}': '原始檔名', '{media-count}': '媒體總數', '{index}': '排序序號', '{rt-user-name}': 'RT User Name', '{rt-user-id}': 'RT User ID' } }, table: { thumb: '縮圖', user: '用戶', type: '類型', size: '大小', postTime: '貼文時間', downTime: '下載時間', action: '動作', go: '前往', del: '刪除' } }
     };
 
     static logIconUri = `data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23999' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z'%3E%3C/path%3E%3Cpolyline points='14 2 14 8 20 8'%3E%3C/polyline%3E%3Cline x1='16' y1='13' x2='8' y2='13'%3E%3C/line%3E%3Cline x1='16' y1='17' x2='8' y2='17'%3E%3C/line%3E%3Cpolyline points='10 9 9 9 8 9'%3E%3C/polyline%3E%3C/svg%3E`;
@@ -286,6 +291,7 @@ class StorageManager {
         this.history = [];
         this.saveHistoryFlag = true;
         this.autoBookmarkFlag = false;
+        this.shortcutEnabledFlag = false;
         this.filenamePattern = Config.defaultFilename;
         this.shortcutKey = 'D';
         this.theme = 'light';
@@ -297,6 +303,7 @@ class StorageManager {
         this.history = rawHistory.map(item => typeof item === 'string' ? { id: item, time: null } : item);
         this.saveHistoryFlag = await GM_getValue('save_history', true);
         this.autoBookmarkFlag = await GM_getValue('auto_bookmark', false);
+        this.shortcutEnabledFlag = await GM_getValue('shortcut_enabled', false);
         this.filenamePattern = await GM_getValue('filename', Config.defaultFilename);
         this.shortcutKey = await GM_getValue('shortcut_key', 'D');
         this.theme = await GM_getValue('tmd_theme', 'light');
@@ -307,6 +314,7 @@ class StorageManager {
         await GM_setValue(key, value);
         if (key === 'save_history') this.saveHistoryFlag = value;
         if (key === 'auto_bookmark') this.autoBookmarkFlag = value;
+        if (key === 'shortcut_enabled') this.shortcutEnabledFlag = value;
         if (key === 'filename') this.filenamePattern = value;
         if (key === 'shortcut_key') this.shortcutKey = value;
         if (key === 'tmd_theme') this.theme = value;
@@ -428,14 +436,76 @@ class DownloadQueue {
         this.next();
     }
 
+    // start(task) {
+    //     return new Promise(resolve => {
+    //         GM_download({
+    //             url: task.url,
+    //             name: task.name,
+    //             onload: () => { task.onload(); resolve(); },
+    //             onerror: r => { task.onerror(r); this.retry(task); resolve(); },
+    //             ontimeout: r => { task.onerror(r); this.retry(task); resolve(); }
+    //         });
+    //     });
+    // }
     start(task) {
         return new Promise(resolve => {
-            GM_download({
+            let finished = false;
+
+            const fail = error => {
+                if (finished) return;
+                finished = true;
+
+                console.error('[TMD] Download failed:', error);
+                task.onerror(error);
+                this.retry(task);
+                resolve();
+            };
+
+            GM_xmlhttpRequest({
+                method: 'GET',
                 url: task.url,
-                name: task.name,
-                onload: () => { task.onload(); resolve(); },
-                onerror: r => { task.onerror(r); this.retry(task); resolve(); },
-                ontimeout: r => { task.onerror(r); this.retry(task); resolve(); }
+                responseType: 'blob',
+                timeout: 120000,
+
+                onload: response => {
+                    if (
+                        response.status < 200 ||
+                        response.status >= 300 ||
+                        !(response.response instanceof Blob)
+                    ) {
+                        fail({
+                            error: 'blob_fetch_failed',
+                            status: response.status
+                        });
+                        return;
+                    }
+
+                    try {
+                        const blobUrl = URL.createObjectURL(response.response);
+
+                        const link = document.createElement('a');
+                        link.href = blobUrl;
+                        link.download = task.name;
+                        link.style.display = 'none';
+
+                        document.documentElement.appendChild(link);
+                        link.click();
+                        link.remove();
+
+                        setTimeout(() => {
+                            URL.revokeObjectURL(blobUrl);
+                        }, 60000);
+
+                        finished = true;
+                        task.onload();
+                        resolve();
+                    } catch (error) {
+                        fail(error);
+                    }
+                },
+
+                onerror: fail,
+                ontimeout: fail
             });
         });
     }
@@ -468,8 +538,57 @@ class UIManager {
     }
 
     renderHistoryUI() {
-        const float_btn_css = `.tmd-history-btn label:before {content: " "; width: 32px; height: 16px; background-position: center; background-repeat: no-repeat; background-image:url("${Config.logIconUri}");}`;
-        document.head.insertAdjacentHTML('beforeend', `<style>${float_btn_css}</style>`);
+        this.historyPositionCleanup?.();
+        this.historyBtn?.remove();
+
+        let style = document.getElementById('tmd-history-icon-style');
+
+        if (!style) {
+            style = document.createElement('style');
+            style.id = 'tmd-history-icon-style';
+            document.head.appendChild(style);
+        }
+
+        style.textContent = `
+        .tmd-history-btn label:before {
+            content: " ";
+            width: 32px;
+            height: 16px;
+            background-position: center;
+            background-repeat: no-repeat;
+            background-image: url("${Config.logIconUri}");
+        }
+
+        .tmd-history-btn.tmd-compact {
+            left: 4px;
+            width: 44px;
+            height: 44px;
+            padding: 0;
+            box-sizing: border-box;
+            justify-content: center;
+            border-radius: 8px;
+        }
+
+        .tmd-history-btn.tmd-compact label {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            font-size: 0;
+            line-height: 0;
+        }
+
+        .tmd-history-btn.tmd-compact label:before {
+            content: "";
+            display: block;
+            flex-shrink: 0;
+            width: 20px;
+            height: 20px;
+            background-size: contain;
+        }
+    `;
 
         this.historyBtn = document.createElement('div');
         this.historyBtn.title = this.lang.history;
@@ -479,10 +598,100 @@ class UIManager {
             this.historyBtn.classList.add('tmd-dark-theme');
         }
 
-        this.historyBtn.innerHTML = `<label>${this.app.storage.history.length}</label>`;
+        this.historyBtn.innerHTML =
+            `<label>${this.app.storage.history.length}</label>`;
+        this.historyBtn.onclick = () => this.showModal();
+
         document.body.appendChild(this.historyBtn);
 
-        this.historyBtn.onclick = () => this.showModal();
+        let lastBottom = '';
+
+        const isVisible = (element) => {
+            if (!element.getClientRects().length) return false;
+
+            for (
+                let node = element;
+                node instanceof Element;
+                node = node.parentElement
+            ) {
+                const computed = getComputedStyle(node);
+
+                if (
+                    computed.display === 'none' ||
+                    computed.visibility === 'hidden' ||
+                    computed.visibility === 'collapse' ||
+                    Number(computed.opacity) === 0
+                ) {
+                    return false;
+                }
+            }
+
+            return true;
+        };
+
+        const updatePosition = () => {
+            const viewportHeight = document.documentElement.clientHeight;
+            const viewportWidth = document.documentElement.clientWidth;
+
+            let hasBottomBar = false;
+            let bottomOffset = 0;
+
+            document.querySelectorAll('[data-testid="BottomBar"]')
+                .forEach(bar => {
+                    if (!isVisible(bar)) return;
+
+                    const rect = bar.getBoundingClientRect();
+
+                    if (
+                        rect.width <= 0 ||
+                        rect.height <= 0 ||
+                        rect.bottom <= 0 ||
+                        rect.top >= viewportHeight ||
+                        rect.right <= 0 ||
+                        rect.left >= viewportWidth
+                    ) {
+                        return;
+                    }
+
+                    hasBottomBar = true;
+
+                    bottomOffset = Math.max(
+                        bottomOffset,
+                        Math.ceil(viewportHeight - Math.max(0, rect.top))
+                    );
+                });
+
+            if (this.historyBtn.classList.contains('tmd-compact') !== hasBottomBar) {
+                this.historyBtn.classList.toggle(
+                    'tmd-compact',
+                    hasBottomBar
+                );
+            }
+
+            const bottom =
+                `calc(16px + max(${bottomOffset}px, env(safe-area-inset-bottom, 0px)))`;
+
+            if (bottom !== lastBottom) {
+                this.historyBtn.style.bottom = bottom;
+                lastBottom = bottom;
+            }
+        };
+
+        window.addEventListener('resize', updatePosition);
+        window.visualViewport?.addEventListener('resize', updatePosition);
+
+        const positionTimer = window.setInterval(updatePosition, 250);
+
+        this.historyPositionCleanup = () => {
+            window.clearInterval(positionTimer);
+            window.removeEventListener('resize', updatePosition);
+            window.visualViewport?.removeEventListener(
+                'resize',
+                updatePosition
+            );
+        };
+
+        updatePosition();
     }
 
     updateHistoryCount() {
@@ -603,6 +812,13 @@ class UIManager {
         auto_bookmark_input.checked = this.app.storage.autoBookmarkFlag;
         $element(auto_bookmark_label, 'span', '', dialogLang.auto_bookmark || 'Auto Bookmark');
 
+        let shortcut_enabled_label = $element(left_checkbox_group, 'label', 'tmd-checkbox-label');
+        shortcut_enabled_label.style.marginBottom = '0';
+        let shortcut_enabled_input = $element(shortcut_enabled_label, 'input');
+        shortcut_enabled_input.type = 'checkbox';
+        shortcut_enabled_input.checked = this.app.storage.shortcutEnabledFlag;
+        $element(shortcut_enabled_label, 'span', '', dialogLang.enable_shortcut || 'Enable Keyboard Shortcut');
+
         let shortcut_label = $element(top_settings_row, 'div', 'tmd-pattern-label');
         shortcut_label.style.marginBottom = '0';
         shortcut_label.innerHTML = `${dialogLang.shortcut || 'Shortcut:'}`;
@@ -611,6 +827,13 @@ class UIManager {
         shortcut_input.maxLength = 1;
         shortcut_input.value = this.app.storage.shortcutKey || 'D';
         shortcut_input.oninput = () => { shortcut_input.value = shortcut_input.value.toUpperCase(); };
+
+        const updateShortcutState = () => {
+            shortcut_input.disabled = !shortcut_enabled_input.checked;
+            shortcut_label.style.opacity = shortcut_enabled_input.checked ? '1' : '0.45';
+        };
+        shortcut_enabled_input.addEventListener('change', updateShortcutState);
+        updateShortcutState();
 
         let pattern_header = $element(settingsContainer, 'div', 'tmd-pattern-header');
         pattern_header.style.marginTop = '20px';
@@ -851,6 +1074,7 @@ class UIManager {
         saveSettingsBtn.onclick = async () => {
             await this.app.storage.setSetting('save_history', save_history_input.checked);
             await this.app.storage.setSetting('auto_bookmark', auto_bookmark_input.checked);
+            await this.app.storage.setSetting('shortcut_enabled', shortcut_enabled_input.checked);
             await this.app.storage.setSetting('filename', pattern_input.value);
             await this.app.storage.setSetting('shortcut_key', shortcut_input.value);
 
@@ -988,7 +1212,7 @@ class TwitterMediaDownloaderApp {
         document.addEventListener('keydown', e => {
             if (['INPUT', 'TEXTAREA'].includes(e.target.tagName) || e.target.isContentEditable) return;
 
-            if (this.storage.shortcutKey && e.key.toUpperCase() === this.storage.shortcutKey.toUpperCase()) {
+            if (this.storage.shortcutEnabledFlag && this.storage.shortcutKey && e.key.toUpperCase() === this.storage.shortcutKey.toUpperCase()) {
                 let container = window.tmdHoveredContainer;
 
                 if (!container || !document.body.contains(container)) {
