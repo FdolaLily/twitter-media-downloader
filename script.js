@@ -3,13 +3,13 @@
 // @name:ja      Twitter/X メディアダウンローダー
 // @name:zh-CN   Twitter/X 媒体下载器
 // @name:zh-TW   Twitter/X 媒體下載器
-// @description        Download Twitter/X media, save animated GIFs, and optionally convert videos up to 10 seconds to GIF locally.
+// @description        Download Twitter/X media; trim videos to GIF and choose file sizes for MP4/GIF over 10 MB.
 // @description:ja     Twitter/Xの画像や動画をワンクリックでダウンロード。カスタムファイル名や履歴に対応。
-// @description:zh-CN  下载 Twitter/X 图片、视频和 GIF 动图；支持将 10 秒以内的短视频在本地转为 GIF。
+// @description:zh-CN  下载 Twitter/X 图片、视频和 GIF；支持 15 秒裁剪转换，超过 10 MB 的 MP4/GIF 可选择大小档位。
 // @description:zh-TW  一鍵下載 Twitter/X 圖片和影片，支援自訂檔名與下載歷史紀錄。
 // @author      ShanksSU
 // @namespace    https://github.com/ShanksSU/twitter-media-downloader
-// @version     0.3.3
+// @version     0.3.7
 // @match       https://twitter.com/*
 // @match       https://x.com/*
 // @icon        https://www.google.com/s2/favicons?sz=64&domain=x.com
@@ -21,6 +21,7 @@
 // ==/UserScript==
 
 class Config {
+    static version = '0.3.7';
     static AUTH_TOKEN = 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
     static defaultFilename = '{user-name}(@{user-id})_{index}';
     static language = {
@@ -433,7 +434,7 @@ OR OTHER DEALINGS IN THE SOFTWARE.
 
 
 */
-const TmdGifenc = (() => {
+const createGifenc = () => {
 const module = { exports: {} };
 const exports = module.exports;
 var __defProp = Object.defineProperty;
@@ -1263,10 +1264,158 @@ var src_default = GIFEncoder;
 
 
 return module.exports;
-})();
+};
+const TmdGifenc = createGifenc();
+
+// A bounded pipeline overlaps video decoding with color quantization without changing quality.
+class GifWorkerPool {
+    static async open() {
+        if (typeof Worker === 'undefined') return null;
+        const pool = new GifWorkerPool();
+        const source = `const codec = (${createGifenc.toString()})();
+            self.onmessage = ({data}) => {
+                try {
+                    const rgba = new Uint8Array(data);
+                    const palette = codec.quantize(rgba, 256);
+                    const pixels = codec.applyPalette(rgba, palette);
+                    self.postMessage({ palette, pixels: pixels.buffer }, [pixels.buffer]);
+                } catch(error) { self.postMessage({ error: String(error.message || error) }); }
+            };
+            self.postMessage({ready:true});`;
+        pool.url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+        try {
+            const count = Math.min(2, Math.max(1, (globalThis.navigator?.hardwareConcurrency || 2) - 1));
+            await Promise.all(Array.from({ length: count }, () => pool.addWorker()));
+            return pool;
+        } catch {
+            // CSP and older browsers may disallow blob workers. The main-thread path remains available.
+            pool.close();
+            return null;
+        }
+    }
+
+    constructor() { this.slots = []; this.closed = false; }
+
+    static error(message) { return Object.assign(new Error(message), { code: 'GIF_WORKER_ERROR' }); }
+
+    addWorker() {
+        return new Promise((resolve, reject) => {
+            const worker = new Worker(this.url);
+            const slot = { worker, pending: null, ready: false };
+            this.slots.push(slot);
+            const timer = setTimeout(() => reject(GifWorkerPool.error('GIF worker startup timed out')), 1500);
+            slot.cancelReady = () => { clearTimeout(timer); reject(GifWorkerPool.error('GIF worker closed')); };
+            worker.onmessage = ({ data }) => {
+                if (data.ready) { clearTimeout(timer); slot.ready = true; resolve(); return; }
+                const pending = slot.pending;
+                if (!pending) return;
+                slot.pending = null;
+                clearTimeout(pending.timer);
+                if (data.error) pending.reject(GifWorkerPool.error(data.error));
+                else pending.resolve({ palette: data.palette, pixels: new Uint8Array(data.pixels) });
+            };
+            worker.onerror = event => {
+                slot.failed = true;
+                event.preventDefault?.();
+                clearTimeout(timer);
+                const error = GifWorkerPool.error(event.message || 'GIF worker failed');
+                if (!slot.ready) reject(error);
+                if (slot.pending) { clearTimeout(slot.pending.timer); slot.pending.reject(error); slot.pending = null; }
+            };
+        });
+    }
+
+    encode(rgba) {
+        const slot = this.slots.find(item => !item.pending && !item.failed);
+        if (this.closed || !slot) return Promise.reject(GifWorkerPool.error('GIF worker unavailable'));
+        const job = new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                slot.failed = true;
+                slot.pending = null;
+                reject(GifWorkerPool.error('GIF worker timed out'));
+            }, 30000);
+            slot.pending = { resolve, reject, timer };
+            const pixels = rgba.byteOffset || rgba.byteLength !== rgba.buffer.byteLength ? rgba.slice() : rgba;
+            try { slot.worker.postMessage(pixels.buffer, [pixels.buffer]); }
+            catch (error) { clearTimeout(timer); slot.pending = null; reject(GifWorkerPool.error(error.message)); }
+        });
+        // A later frame can fail before the preceding frame has been flushed.
+        job.catch(() => {});
+        return job;
+    }
+
+    close() {
+        this.closed = true;
+        for (const slot of this.slots) {
+            if (!slot.ready) slot.cancelReady();
+            if (slot.pending) { clearTimeout(slot.pending.timer); slot.pending.reject(GifWorkerPool.error('GIF worker closed')); slot.pending = null; }
+            slot.worker.terminate();
+        }
+        if (this.url) { URL.revokeObjectURL(this.url); this.url = null; }
+    }
+}
+
+class MediaSize {
+    static threshold = 10 * 1024 * 1024;
+    static approvedGifs = new WeakSet();
+
+    static gifVariant(variants, maxSide) {
+        const ranked = [...variants].sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+        const sized = ranked.map(variant => {
+            const dimensions = variant.url?.match(/\/(\d{2,5})x(\d{2,5})\//);
+            return { variant, side: dimensions ? Math.max(Number(dimensions[1]), Number(dimensions[2])) : 0 };
+        }).filter(item => item.side >= maxSide).sort((a, b) => a.side - b.side);
+        return sized[0]?.variant || ranked[0];
+    }
+
+    static format(bytes, estimated = true) {
+        if (!Number.isFinite(bytes) || bytes <= 0) return 'Unknown / 无法预估';
+        return `${estimated ? '≈ ' : ''}${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+    }
+
+    static cancelled() {
+        return Object.assign(new Error('Download cancelled / 已取消下载'), { code: 'GIF_CANCELLED' });
+    }
+
+    static async choose(choices, chooseSize, kind) {
+        if (!chooseSize) throw new Error('Size selection unavailable. Refresh X and retry / 大小选择未就绪，请刷新 X 后重试');
+        const id = await chooseSize({ kind, choices });
+        if (id == null) throw this.cancelled();
+        const chosen = choices.find(choice => choice.id === id);
+        if (!chosen) throw new Error('Invalid size option / 无效的大小选项');
+        return chosen;
+    }
+
+    static async videoChoices(variants, duration) {
+        const unique = [...new Map(variants.filter(v => v.content_type === 'video/mp4' && v.url)
+            .map(v => [v.url, v])).values()].sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+        // X normally supplies two or three MP4 renditions. Keep high/middle/low if more exist.
+        const candidates = unique.length <= 3 ? unique : [unique[0], unique[Math.floor(unique.length / 2)], unique.at(-1)];
+        const choices = await Promise.all(candidates.map(async variant => {
+            let bytes = null;
+            try {
+                const response = await fetch(variant.url, { method: 'HEAD', credentials: 'omit', signal: AbortSignal.timeout(8000) });
+                const length = Number(response.headers.get('content-length'));
+                if (response.ok && Number.isFinite(length) && length > 0) bytes = length;
+            } catch { /* Some media servers omit or block HEAD; use bitrate and duration. */ }
+            const estimated = bytes == null;
+            if (estimated && Number.isFinite(duration) && duration > 0 && variant.bitrate > 0) {
+                bytes = Math.ceil(variant.bitrate * duration / 8 * 1.05);
+            }
+            const resolution = variant.url.match(/\/(\d{2,5})x(\d{2,5})\//);
+            const detail = [resolution ? `${resolution[1]} × ${resolution[2]}` : '',
+                variant.bitrate > 0 ? `${(variant.bitrate / 1000000).toFixed(2)} Mbps` : 'MP4'].filter(Boolean).join(' · ');
+            return { id: variant.url, url: variant.url, bytes, estimated, detail };
+        }));
+        // Known sizes determine the default largest option; retain bitrate order if unknown.
+        if (choices.every(choice => choice.bytes != null)) choices.sort((a, b) => b.bytes - a.bytes);
+        return choices;
+    }
+}
 
 // GIF encoding runs locally; media is never sent to a conversion service.
 class GifConverter {
+    static outputs = new WeakMap();
     static fps = 15;
     static maxSide = 640;
     static maxSeconds = 120;
@@ -1307,6 +1456,58 @@ class GifConverter {
         }
     }
 
+    static validateRange(range, duration, maxSeconds) {
+        if (!range || !Number.isFinite(range.start) || !Number.isFinite(range.end) ||
+            range.start < 0 || range.end > duration || range.end <= range.start) {
+            throw new Error('GIF: invalid trim range / 裁剪起止时间无效');
+        }
+        if (range.end - range.start > maxSeconds + 1e-8) {
+            this.validateDuration(range.end - range.start, maxSeconds);
+        }
+    }
+
+    static profiles(video) {
+        return [
+            { id: 'large', maxSide: this.maxSide, fps: this.fps },
+            { id: 'medium', maxSide: Math.min(480, this.maxSide), fps: Math.min(12, this.fps) },
+            { id: 'small', maxSide: Math.min(320, this.maxSide), fps: Math.min(10, this.fps) }
+        ].map(profile => {
+            const scale = Math.min(1, profile.maxSide / Math.max(video.videoWidth, video.videoHeight));
+            return { ...profile, width: Math.max(1, Math.round(video.videoWidth * scale)),
+                height: Math.max(1, Math.round(video.videoHeight * scale)) };
+        }).filter((profile, i, all) => all.findIndex(p => p.width === profile.width && p.height === profile.height && p.fps === profile.fps) === i);
+    }
+
+    static sizeChoices(profiles, largestBytes, duration, largestExact = false) {
+        const largest = profiles[0];
+        const largeFrames = Math.ceil(duration * largest.fps);
+        return profiles.map((profile, i) => ({ ...profile,
+            bytes: Math.ceil(largestBytes * profile.width * profile.height / (largest.width * largest.height)
+                * Math.ceil(duration * profile.fps) / largeFrames),
+            estimated: i !== 0 || !largestExact,
+            detail: `${profile.width} × ${profile.height} · ${profile.fps} fps`
+        }));
+    }
+
+    static async captureFrame(video, canvas, context, time) {
+        if (Math.abs(video.currentTime - time) > 0.000001) {
+            await this.waitFor(video, 'seeked', () => { video.currentTime = time; });
+        }
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const data = context.getImageData(0, 0, canvas.width, canvas.height).data;
+        // Use this userscript realm's typed-array constructor (Tampermonkey sandbox).
+        return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    }
+
+    static async writeFrame(video, canvas, context, encoder, time, delay, pool = null) {
+        const rgba = await this.captureFrame(video, canvas, context, time);
+        let palette, pixels;
+        if (pool) ({ palette, pixels } = await pool.encode(rgba));
+        else { palette = TmdGifenc.quantize(rgba, 256); pixels = TmdGifenc.applyPalette(rgba, palette); }
+        encoder.writeFrame(pixels, canvas.width, canvas.height, { palette, delay, repeat: 0 });
+        await new Promise(resolve => setTimeout(resolve, 0));
+    }
+
     static async encode(url, progress = () => {}, options = {}) {
         progress('GIF ↓');
         const controller = new AbortController();
@@ -1326,12 +1527,15 @@ class GifConverter {
         if (signature === 'GIF87a' || signature === 'GIF89a') {
             if (options.requireVideo) throw new Error('GIF: expected a video source / 需要视频源文件');
             progress('GIF 100%');
-            return new Blob([source], { type: 'image/gif' });
+            const original = new Blob([source], { type: 'image/gif' });
+            this.outputs.set(original, { native: true });
+            return original;
         }
 
         const sourceUrl = URL.createObjectURL(source);
         const video = document.createElement('video');
         const canvas = document.createElement('canvas');
+        let pool = null;
         video.muted = true;
         video.playsInline = true;
         video.preload = 'auto';
@@ -1343,41 +1547,121 @@ class GifConverter {
             if (!Number.isFinite(duration) || duration <= 0 || !video.videoWidth || !video.videoHeight) {
                 throw new Error('GIF: invalid video metadata / 无效的视频信息');
             }
-            this.validateDuration(duration, options.maxSeconds ?? this.maxSeconds);
-            const scale = Math.min(1, this.maxSide / Math.max(video.videoWidth, video.videoHeight));
-            canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
-            canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
-            const context = canvas.getContext('2d', { willReadFrequently: true });
-            if (!context) throw new Error('GIF: Canvas unavailable');
-            const encoder = TmdGifenc.GIFEncoder();
-            const count = Math.max(1, Math.ceil(duration * this.fps));
-            // Evenly sample the entire clip. Round cumulative timing to GIF's 10 ms units.
-            for (let frame = 0; frame < count; frame++) {
-                const time = frame * duration / count;
-                if (Math.abs(video.currentTime - time) > 0.000001) {
-                    await this.waitFor(video, 'seeked', () => { video.currentTime = time; });
+            const maxSeconds = options.maxSeconds ?? this.maxSeconds;
+            let range = options.range || { start: 0, end: duration };
+            if (!options.range && duration > maxSeconds && options.editRange) {
+                progress('GIF ✂');
+                range = await options.editRange({ url: sourceUrl, duration, maxSeconds });
+                if (!range) {
+                    const error = new Error('GIF conversion cancelled / 已取消 GIF 转换');
+                    error.code = 'GIF_CANCELLED';
+                    throw error;
                 }
-                context.drawImage(video, 0, 0, canvas.width, canvas.height);
-                const data = context.getImageData(0, 0, canvas.width, canvas.height).data;
-                // Use this userscript realm's typed-array constructor (Tampermonkey sandbox).
-                const rgba = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-                const palette = TmdGifenc.quantize(rgba, 256);
-                const pixels = TmdGifenc.applyPalette(rgba, palette);
-                const start = Math.round(frame * duration * 100 / count);
-                const end = Math.round((frame + 1) * duration * 100 / count);
-                encoder.writeFrame(pixels, canvas.width, canvas.height, {
-                    palette, delay: Math.max(2, end - start) * 10, repeat: 0
-                });
-                if (encoder.bytesView().byteLength > this.maxBytes) {
-                    throw new Error('GIF: output exceeds 100 MB / GIF 文件超过 100 MB');
-                }
-                progress(`GIF ${Math.round((frame + 1) / count * 100)}%`);
-                // Let the page paint between frames; only one GIF is encoded at a time.
-                await new Promise(resolve => setTimeout(resolve, 0));
             }
-            encoder.finish();
-            return new Blob([encoder.bytesView()], { type: 'image/gif' });
+            this.validateRange(range, duration, maxSeconds);
+            const clipDuration = Math.min(range.end - range.start, maxSeconds);
+            const profiles = this.profiles(video);
+            let profile = options.profileId ? profiles.find(item => item.id === options.profileId) : profiles[0];
+            if (!profile) throw new Error('Invalid GIF profile / 无效的 GIF 档位');
+            let sizeChosen = false;
+            pool = await GifWorkerPool.open();
+            const prepareCanvas = current => {
+                canvas.width = current.width;
+                canvas.height = current.height;
+                const context = canvas.getContext('2d', { willReadFrequently: true });
+                if (!context) throw new Error('GIF: Canvas unavailable');
+                return context;
+            };
+            const estimateProfile = async current => {
+                const context = prepareCanvas(current);
+                const sample = TmdGifenc.GIFEncoder();
+                const frameCount = Math.max(1, Math.ceil(clipDuration * current.fps));
+                const sampleCount = Math.min(6, frameCount);
+                // Encode spread-out sample frames; GIF size depends on image complexity, not MP4 bitrate.
+                for (let i = 0; i < sampleCount; i++) {
+                    const frame = sampleCount === 1 ? 0 : Math.round(i * (frameCount - 1) / (sampleCount - 1));
+                    try {
+                        await this.writeFrame(video, canvas, context, sample, range.start + frame * clipDuration / frameCount, 70, pool);
+                    } catch (error) {
+                        if (error.code !== 'GIF_WORKER_ERROR' || !pool) throw error;
+                        pool.close(); pool = null;
+                        return estimateProfile(current);
+                    }
+                }
+                sample.finish();
+                return Math.ceil(sample.bytesView().byteLength / sampleCount * frameCount);
+            };
+            const measuredChoices = async (largestBytes, largestExact = false) => {
+                const choices = this.sizeChoices(profiles, largestBytes, clipDuration, largestExact);
+                // Resizing changes compression efficiency: measure each tier rather than scaling by pixel count.
+                for (let i = 1; i < choices.length; i++) {
+                    progress(`GIF ≈ ${i + 1}/${choices.length}`);
+                    choices[i].bytes = await estimateProfile(profiles[i]);
+                }
+                return choices;
+            };
+            if (options.chooseSize && !options.profileId) {
+                progress('GIF ≈');
+                const estimate = await estimateProfile(profile);
+                progress(`GIF ${MediaSize.format(estimate)}`);
+                if (estimate > MediaSize.threshold) {
+                    profile = await MediaSize.choose(await measuredChoices(estimate), options.chooseSize, 'GIF');
+                    sizeChosen = true;
+                }
+            }
+            const render = async current => {
+                const context = prepareCanvas(current);
+                const encoder = TmdGifenc.GIFEncoder();
+                const count = Math.max(1, Math.ceil(clipDuration * current.fps));
+                const pending = [];
+                const flush = async () => {
+                    const item = pending.shift();
+                    const { pixels, palette } = await item.job;
+                    encoder.writeFrame(pixels, canvas.width, canvas.height, { palette, delay: item.delay, repeat: 0 });
+                    if (encoder.bytesView().byteLength > this.maxBytes) throw new Error('GIF: output exceeds 100 MB / GIF 文件超过 100 MB');
+                    progress(`GIF ${Math.round((item.frame + 1) / count * 100)}%`);
+                };
+                try {
+                    // Evenly sample the selected clip. Round cumulative timing to GIF's 10 ms units.
+                    for (let frame = 0; frame < count; frame++) {
+                        const start = Math.round(frame * clipDuration * 100 / count);
+                        const end = Math.round((frame + 1) * clipDuration * 100 / count);
+                        const time = range.start + frame * clipDuration / count;
+                        const delay = Math.max(2, end - start) * 10;
+                        if (pool) {
+                            const rgba = await this.captureFrame(video, canvas, context, time);
+                            pending.push({ frame, delay, job: pool.encode(rgba) });
+                            if (pending.length >= pool.slots.length) await flush();
+                            continue;
+                        }
+                        await this.writeFrame(video, canvas, context, encoder, time, delay);
+                        if (encoder.bytesView().byteLength > this.maxBytes) {
+                            throw new Error('GIF: output exceeds 100 MB / GIF 文件超过 100 MB');
+                        }
+                        progress(`GIF ${Math.round((frame + 1) / count * 100)}%`);
+                    }
+                    while (pending.length) await flush();
+                } catch (error) {
+                    if (pool) { pool.close(); pool = null; }
+                    await Promise.allSettled(pending.map(item => item.job));
+                    if (error.code === 'GIF_WORKER_ERROR') return render(current);
+                    throw error;
+                }
+                encoder.finish();
+                return new Blob([encoder.bytesView()], { type: 'image/gif' });
+            };
+            let result = await render(profile);
+            // A sample can underestimate a changing scene. Offer sizes before download in that case too.
+            if (!sizeChosen && options.chooseSize && !options.profileId && result.size > MediaSize.threshold) {
+                profile = await MediaSize.choose(await measuredChoices(result.size, true), options.chooseSize, 'GIF');
+                sizeChosen = true;
+                if (profile.id !== profiles[0].id) result = await render(profile);
+            }
+            if (sizeChosen || options.sizeApproved) MediaSize.approvedGifs.add(result);
+            this.outputs.set(result, { range: { ...range }, profiles });
+            return result;
         } finally {
+            pool?.close();
             video.pause();
             video.removeAttribute('src');
             video.load();
@@ -1389,7 +1673,8 @@ class GifConverter {
 }
 
 class DownloadQueue {
-    constructor() {
+    constructor(chooseSize) {
+        this.chooseSize = chooseSize;
         this.tasks = [];
         this.thread = 0;
         this.max_thread = 2;
@@ -1412,11 +1697,43 @@ class DownloadQueue {
     async start(task) {
         let objectUrl;
         let bytes;
+        let estimatedBytes = false;
         let failure;
         try {
             let url = task.url;
+            let name = task.name;
+            if (task.videoOptions) {
+                task.onprogress?.('MP4 ≈');
+                const choices = await MediaSize.videoChoices(task.videoOptions.variants, task.videoOptions.duration);
+                if (!choices.length) throw new Error('No MP4 source available / 未找到 MP4 视频源');
+                let selected = choices[0];
+                if (choices.some(choice => choice.bytes > MediaSize.threshold) || (choices.length > 1 && choices.some(choice => choice.bytes == null))) {
+                    selected = await MediaSize.choose(choices, task.videoOptions.chooseSize, 'MP4');
+                }
+                url = selected.url;
+                name = task.videoOptions.nameForUrl?.(url) || name;
+                bytes = selected.bytes;
+                estimatedBytes = selected.estimated;
+                task.onprogress?.(`MP4 ${MediaSize.format(bytes, estimatedBytes)}`);
+            }
             if (task.gif) {
-                const blob = await GifConverter.convert(url, task.onprogress, task.gifOptions);
+                let blob = await GifConverter.convert(url, task.onprogress, task.gifOptions);
+                // Independent final gate: no large GIF can reach GM_download without a size decision.
+                // This also covers native GIFs and callers that omitted the converter's picker callback.
+                if (blob.size > MediaSize.threshold && !MediaSize.approvedGifs.has(blob)) {
+                    const metadata = GifConverter.outputs.get(blob);
+                    const choices = metadata?.profiles
+                        ? GifConverter.sizeChoices(metadata.profiles, blob.size, metadata.range.end - metadata.range.start, true)
+                        : [{ id: 'original', bytes: blob.size, estimated: false, detail: 'Original GIF / 原始 GIF' }];
+                    const picker = task.gifOptions?.chooseSize || this.chooseSize;
+                    const selected = await MediaSize.choose(choices, picker && (details => picker({ ...details, name })), 'GIF');
+                    if (metadata?.profiles && selected.id !== metadata.profiles[0].id) {
+                        blob = await GifConverter.convert(url, task.onprogress, {
+                            ...task.gifOptions, range: metadata.range, profileId: selected.id, sizeApproved: true
+                        });
+                    }
+                    MediaSize.approvedGifs.add(blob);
+                }
                 bytes = blob.size;
                 objectUrl = URL.createObjectURL(blob);
                 url = objectUrl;
@@ -1425,7 +1742,7 @@ class DownloadQueue {
             for (let attempt = 0; attempt < 3; attempt++) {
                 try {
                     await new Promise((resolve, reject) => {
-                        GM_download({ url, name: task.name, onload: resolve, onerror: reject, ontimeout: reject });
+                        GM_download({ url, name, onload: resolve, onerror: reject, ontimeout: reject });
                     });
                     failure = null;
                     break;
@@ -1435,14 +1752,40 @@ class DownloadQueue {
         finally { if (objectUrl) URL.revokeObjectURL(objectUrl); }
 
         try {
-            if (failure) await task.onerror(failure);
-            else await task.onload(bytes);
+            if (failure?.code === 'GIF_CANCELLED' && task.oncancel) await task.oncancel();
+            else if (failure) await task.onerror(failure);
+            else await task.onload(bytes, estimatedBytes);
         } catch (error) { console.error('[TMD] Download callback failed', error); }
     }
 }
 
 
+// Keep timeline constraints identical for pointer, keyboard, and numeric edits.
+class GifTrimRange {
+    static adjust(range, part, value, duration, maxSeconds) {
+        const clamp = (n, low, high) => Math.max(low, Math.min(high, n));
+        const minimum = Math.min(0.01, duration);
+        let { start, end } = range;
+        let limited = false;
+        if (!Number.isFinite(value)) return { start, end, limited };
+        if (part === 'start') {
+            limited = end - value > maxSeconds + 1e-8;
+            start = clamp(value, Math.max(0, end - maxSeconds), end - minimum);
+        } else if (part === 'end') {
+            limited = value - start > maxSeconds + 1e-8;
+            end = clamp(value, start + minimum, Math.min(duration, start + maxSeconds));
+        } else if (part === 'move') {
+            const length = end - start;
+            start = clamp(value, 0, duration - length);
+            end = start + length;
+        }
+        return { start, end, limited };
+    }
+}
+
 class UIManager {
+    static dialogTail = Promise.resolve();
+
     constructor(app) {
         this.app = app;
         this.lang = Config.language[document.documentElement.lang] || Config.language.en;
@@ -1453,12 +1796,13 @@ class UIManager {
     }
 
     setButtonStatus(btn, css, title) {
+        btn.dataset.tmdVersion = Config.version;
         if (css !== 'loading') delete btn.dataset.tmdProgress;
         if (css) {
             btn.classList.remove('download', 'completed', 'exist', 'loading', 'failed');
             btn.classList.add(css);
         }
-        if (title) btn.title = title;
+        if (title) btn.title = `${title} · v${Config.version}`;
     }
 
     addGifButton(downloadButton, run) {
@@ -1468,7 +1812,9 @@ class UIManager {
         button.className = 'tmd-down tmd-gif download';
         if (downloadButton.classList.contains('tmd-media')) button.classList.add('tmd-media');
         button.title = document.documentElement.lang.startsWith('zh')
-            ? '短视频转 GIF（≤10 秒，无声音）' : 'Convert video to GIF (≤10 seconds, no audio)';
+            ? '视频转 GIF（最多 15 秒，长视频可裁剪，无声音）' : 'Convert video to GIF (up to 15 seconds; trim longer videos; no audio)';
+        button.title += ` · v${Config.version}`;
+        button.dataset.tmdVersion = Config.version;
         button.setAttribute('aria-label', button.title);
         button.onclick = event => {
             event.preventDefault();
@@ -1487,6 +1833,324 @@ class UIManager {
         document.body.appendChild(notice);
         this.notice = notice;
         setTimeout(() => notice.remove(), 6000);
+    }
+
+    withDialog(open) {
+        const job = UIManager.dialogTail.then(open);
+        UIManager.dialogTail = job.catch(() => {});
+        return job;
+    }
+
+    chooseMediaSize(details) {
+        return this.withDialog(() => this.renderMediaSize(details));
+    }
+
+    renderMediaSize({ kind, choices, name = '' }) {
+        const zh = document.documentElement.lang.startsWith('zh');
+        const label = (cn, en) => zh ? cn : en;
+        return new Promise((resolve, reject) => {
+            const previousFocus = document.activeElement;
+            const dialog = document.createElement('dialog');
+            dialog.className = 'tmd-size-dialog';
+            dialog.setAttribute('aria-label', label(`选择 ${kind} 文件大小`, `Choose ${kind} file size`));
+            dialog.innerHTML = `<style>
+                .tmd-size-dialog{box-sizing:border-box;width:min(520px,94vw);max-height:90vh;overflow:auto;padding:24px;border:1px solid #64748b;border-radius:16px;background:oklch(21% .028 255);color:#f8fafc;font:15px/1.5 system-ui,sans-serif;color-scheme:dark}
+                .tmd-size-dialog::backdrop{background:#000b}
+                .tmd-size-dialog h2{font-size:22px;margin:0 0 8px}
+                .tmd-size-dialog p{margin:8px 0;color:#cbd5e1}
+                .tmd-size-dialog .tmd-size-name{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+                .tmd-size-dialog .tmd-size-choices{display:grid;gap:10px;margin:18px 0}
+                .tmd-size-dialog .tmd-size-option{display:grid;grid-template-columns:20px 1fr auto;gap:4px 10px;padding:14px;border:1px solid #64748b;border-radius:8px;cursor:pointer}
+                .tmd-size-dialog .tmd-size-option:has(input:checked){border:2px solid #5eead4;padding:13px;background:#064e3b}
+                .tmd-size-dialog .tmd-size-option:hover{border-color:#5eead4}
+                .tmd-size-dialog input{accent-color:#5eead4;margin:4px 0;align-self:start}
+                .tmd-size-dialog .tmd-size-value{font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
+                .tmd-size-dialog .tmd-size-detail{grid-column:2 / 4;font-size:13px;color:#cbd5e1}
+                .tmd-size-dialog .tmd-size-note{font-size:13px}
+                .tmd-size-dialog .tmd-size-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:20px}
+                .tmd-size-dialog button{padding:10px 16px;border:1px solid #64748b;border-radius:8px;background:#1e293b;color:#fff;font:inherit;cursor:pointer}
+                .tmd-size-dialog button[data-action=confirm]{background:#065f46;border-color:#5eead4}
+                .tmd-size-dialog :focus-visible{outline:2px solid #fff;outline-offset:3px}
+                @media(max-width:480px){.tmd-size-dialog{padding:18px}.tmd-size-dialog .tmd-size-option{padding:10px;gap:4px 8px}.tmd-size-dialog .tmd-size-option:has(input:checked){padding:9px}}
+            </style>
+            <h2>${label(`选择 ${kind} 文件大小`, `Choose ${kind} file size`)}</h2>
+            <p>${choices.length === 1 ? label('已确认文件超过 10 MB，请选择下载或取消。', 'The file exceeds 10 MB. Confirm the download or cancel.') : label('较大文件可选择更小档位，默认保留最大档。', 'Choose a smaller size if needed. The largest option is selected by default.')}</p>
+            <p class="tmd-size-name"></p>
+            <div class="tmd-size-choices"></div>
+            <p class="tmd-size-note"></p>
+            <div class="tmd-size-actions"><button type="button" data-action="cancel">${label('取消', 'Cancel')}</button><button type="button" data-action="confirm">${choices.length === 1 ? label('下载原文件', 'Download original') : kind === 'GIF' ? label('转换并下载', 'Convert & download') : label('下载所选档位', 'Download selection')}</button></div>`;
+            const filename = dialog.querySelector('.tmd-size-name');
+            filename.textContent = name;
+            filename.title = name;
+            dialog.querySelector('.tmd-size-note').textContent = kind === 'GIF' && choices.length === 1
+                ? label('此原始 GIF 超过 10 MB。确认后按原文件保存，或取消下载。', 'This original GIF exceeds 10 MB. Confirm to keep the original file, or cancel.')
+                : kind === 'GIF'
+                ? label('≈ 为预估大小，实际结果随画面变化。小档会降低分辨率或帧率，时长不变。', '≈ means estimated size; the result depends on the images. Smaller options reduce resolution or frame rate, keeping the same duration.')
+                : choices.length === 1
+                    ? label('此视频仅提供一个 MP4 版本，暂无更小档位。', 'Only one MP4 version is available for this video.')
+                    : label('较小档位可能降低清晰度。≈ 为按码率估算，实际大小可能不同。', 'Smaller options may reduce resolution. ≈ is a bitrate estimate; actual size may differ.');
+            let chosen = choices[0]?.id;
+            for (let i = 0; i < choices.length; i++) {
+                const choice = choices[i];
+                const option = document.createElement('label');
+                option.className = 'tmd-size-option';
+                option.innerHTML = '<input type="radio" name="tmd-file-size"><strong></strong><span class="tmd-size-value"></span><span class="tmd-size-detail"></span>';
+                const radio = option.querySelector('input');
+                radio.value = choice.id;
+                radio.checked = i === 0;
+                radio.onchange = () => { if (radio.checked) chosen = choice.id; };
+                const tier = i === 0 ? label('大 · 默认', 'Large · Default') : i === choices.length - 1 ? label('小', 'Small') : label('中', 'Medium');
+                option.querySelector('strong').textContent = tier;
+                option.querySelector('.tmd-size-value').textContent = choice.bytes == null ? label('无法预估', 'Unknown size') : MediaSize.format(choice.bytes, choice.estimated);
+                option.querySelector('.tmd-size-detail').textContent = choice.detail;
+                dialog.querySelector('.tmd-size-choices').appendChild(option);
+            }
+            let settled = false;
+            const finish = (value, error) => {
+                if (settled) return;
+                settled = true;
+                dialog.close();
+                dialog.remove();
+                if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
+                if (error) reject(error); else resolve(value);
+            };
+            dialog.querySelector('[data-action=confirm]').onclick = () => finish(chosen);
+            dialog.querySelector('[data-action=cancel]').onclick = () => finish(null);
+            dialog.oncancel = event => { event.preventDefault(); finish(null); };
+            dialog.onclose = () => finish(null);
+            document.body.appendChild(dialog);
+            try { dialog.showModal(); } catch (error) { finish(null, error); }
+        });
+    }
+
+    editGifRange(source) {
+        return this.withDialog(() => this.renderGifRange(source));
+    }
+
+    renderGifRange({ url, duration, maxSeconds }) {
+        const zh = document.documentElement.lang.startsWith('zh');
+        const label = (cn, en) => zh ? cn : en;
+        return new Promise((resolve, reject) => {
+            const previousFocus = document.activeElement;
+            const dialog = document.createElement('dialog');
+            dialog.className = 'tmd-trim-editor';
+            dialog.setAttribute('aria-label', label('裁剪视频并转为 GIF', 'Trim video to GIF'));
+            dialog.innerHTML = `<style>
+                .tmd-trim-editor{--trim-accent:oklch(83% .14 175);--trim-muted:oklch(75% .025 250);box-sizing:border-box;width:min(760px,94vw);max-height:92vh;overflow:auto;padding:24px;border:1px solid #64748b;border-radius:16px;background:oklch(21% .028 255);color:#f8fafc;font:15px/1.5 system-ui,sans-serif;color-scheme:dark;z-index:2147483647}
+                .tmd-trim-editor::backdrop{background:#000b}
+                .tmd-trim-editor h2{font-size:22px;margin:0 0 8px;color:inherit}
+                .tmd-trim-editor p{margin:8px 0 14px;color:#cbd5e1}
+                .tmd-trim-editor video{display:block;width:100%;max-height:29vh;background:#000;border-radius:8px}
+                .tmd-trim-editor label{display:flex;align-items:center;gap:8px}
+                .tmd-trim-editor input[type=number]{box-sizing:border-box;min-width:0;width:96px;padding:6px;border:1px solid #64748b;border-radius:6px;background:#1e293b;color:#fff;font:inherit;font-variant-numeric:tabular-nums}
+                .tmd-trim-editor button{padding:9px 14px;border:1px solid #64748b;border-radius:8px;background:#1e293b;color:white;font:inherit;cursor:pointer}
+                .tmd-trim-editor button:disabled{opacity:.45;cursor:not-allowed}
+                .tmd-trim-editor button:hover:not(:disabled){border-color:var(--trim-accent)}
+                .tmd-trim-editor .tmd-trim-legend,.tmd-trim-editor .tmd-trim-fields,.tmd-trim-editor .tmd-trim-clock{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:12px;font-variant-numeric:tabular-nums}
+                .tmd-trim-editor .tmd-trim-legend{font-size:13px;color:var(--trim-muted);justify-content:flex-start}
+                .tmd-trim-editor .tmd-trim-legend span{display:flex;gap:6px;align-items:center}
+                .tmd-trim-editor .tmd-trim-legend i{display:inline-block;width:16px;height:12px;border:1px solid #94a3b8;background:repeating-linear-gradient(135deg,#64748b 0 2px,#273447 2px 6px)}
+                .tmd-trim-editor .tmd-trim-legend .tmd-trim-kept{background:var(--trim-accent);border-color:var(--trim-accent)}
+                .tmd-trim-editor .tmd-trim-legend .tmd-trim-position{width:3px;background:#fff;border:0}
+                .tmd-trim-editor .tmd-trim-timeline{position:relative;height:64px;margin:18px 12px 0;touch-action:none;user-select:none;cursor:crosshair}
+                .tmd-trim-editor .tmd-trim-track{position:absolute;inset:10px 0;border-radius:6px;background:repeating-linear-gradient(135deg,#475569 0 2px,#273447 2px 9px);box-shadow:inset 0 0 0 1px #64748b;overflow:hidden}
+                .tmd-trim-editor .tmd-trim-selection{position:absolute;top:10px;height:44px;box-sizing:border-box;border:3px solid var(--trim-accent);background:oklch(42% .075 175);cursor:grab;min-width:2px}
+                .tmd-trim-editor .tmd-trim-selection:active{cursor:grabbing}
+                .tmd-trim-editor .tmd-trim-selection::after{content:'↔';position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);color:var(--trim-accent);font-size:22px;pointer-events:none}
+                .tmd-trim-editor .tmd-trim-handle{position:absolute;top:4px;width:22px;height:56px;transform:translateX(-50%);box-sizing:border-box;border:2px solid #072e29;border-radius:6px;background:var(--trim-accent);color:#072e29;cursor:ew-resize;z-index:3;display:grid;place-items:center;font-size:18px;font-weight:800}
+                .tmd-trim-editor .tmd-trim-handle:hover{background:#d1fae5}
+                .tmd-trim-editor .tmd-trim-playhead{position:absolute;top:0;bottom:0;width:2px;background:#fff;transform:translateX(-50%);pointer-events:none;z-index:4;box-shadow:0 0 0 1px #0008}
+                .tmd-trim-editor .tmd-trim-playhead::before{content:'';position:absolute;left:-4px;top:-1px;border:5px solid transparent;border-top-color:#fff}
+                .tmd-trim-editor .tmd-trim-ticks{display:flex;justify-content:space-between;margin:2px 12px 0;color:var(--trim-muted);font-size:12px;font-variant-numeric:tabular-nums}
+                .tmd-trim-editor .tmd-trim-help{font-size:12px;margin:8px 0;color:var(--trim-muted)}
+                .tmd-trim-editor .tmd-trim-warning{color:#fbbf24;min-height:20px;font-size:13px;margin-top:4px}
+                .tmd-trim-editor .tmd-trim-at-limit{--trim-accent:oklch(85% .16 85)}
+                .tmd-trim-editor .tmd-trim-actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end;margin-top:18px}
+                .tmd-trim-editor .tmd-trim-confirm{background:#065f46;border-color:var(--trim-accent)}
+                .tmd-trim-editor .tmd-trim-summary{display:block;color:var(--trim-accent);font-variant-numeric:tabular-nums}
+                .tmd-trim-editor :focus-visible{outline:2px solid #fff;outline-offset:3px}
+                @media(max-width:480px){.tmd-trim-editor{padding:16px;font-size:14px}.tmd-trim-editor h2{font-size:20px}.tmd-trim-editor .tmd-trim-fields{gap:8px}.tmd-trim-editor input[type=number]{width:78px}.tmd-trim-editor .tmd-trim-actions button{flex:1;padding:9px 8px}}
+            </style>
+            <h2>${label('裁剪视频并转为 GIF', 'Trim video to GIF')}</h2>
+            <p>${label(`视频长 ${duration.toFixed(2)} 秒。请选择不超过 ${maxSeconds} 秒的片段，GIF 不包含声音。`, `Video length: ${duration.toFixed(2)}s. Select up to ${maxSeconds}s. GIFs have no audio.`)}</p>
+            <video playsinline muted preload="auto" aria-label="${label('视频预览', 'Video preview')}"></video>
+            <div class="tmd-trim-clock"><span data-current-time>0.00 / ${duration.toFixed(2)} s</span><output class="tmd-trim-summary" aria-live="polite"></output></div>
+            <div class="tmd-trim-legend"><span><i class="tmd-trim-kept"></i>${label('保留片段', 'Keep')}</span><span><i></i>${label('移除片段', 'Remove')}</span><span><i class="tmd-trim-position"></i>${label('当前画面', 'Playhead')}</span></div>
+            <div class="tmd-trim-timeline" aria-label="${label('剪辑时间轴', 'Trim timeline')}">
+                <div class="tmd-trim-track"></div>
+                <div class="tmd-trim-selection" data-drag="move" role="slider" tabindex="0" aria-label="${label('移动保留片段', 'Move selection')}"></div>
+                <div class="tmd-trim-handle" data-drag="start" role="slider" tabindex="0" aria-label="${label('剪辑开始时间', 'Trim start')}">❮</div>
+                <div class="tmd-trim-handle" data-drag="end" role="slider" tabindex="0" aria-label="${label('剪辑结束时间', 'Trim end')}">❯</div>
+                <div class="tmd-trim-playhead"></div>
+            </div>
+            <div class="tmd-trim-ticks"><span>0 s</span><span>${(duration / 2).toFixed(2)} s</span><span>${duration.toFixed(2)} s</span></div>
+            <p class="tmd-trim-help">${label('拖动两端调整时长，拖动中间整体移动；点击时间轴预览画面。方向键微调，Shift 加速。', 'Drag the handles to trim or the center to move. Click to seek. Arrow keys fine-tune; Shift moves faster.')}</p>
+            <div class="tmd-trim-fields">
+                <label>${label('开始（秒）', 'Start (s)')} <input data-field="start" type="number" min="0" max="${duration}" step="0.01" value="0"></label>
+                <label>${label('结束（秒）', 'End (s)')} <input data-field="end" type="number" min="0" max="${duration}" step="0.01" value="${Math.min(maxSeconds, duration)}"></label>
+            </div>
+            <div class="tmd-trim-warning" role="status" aria-live="polite"></div>
+            <div class="tmd-trim-actions">
+                <button type="button" data-action="preview">${label('播放选中片段', 'Play selection')}</button>
+                <button type="button" data-action="cancel">${label('取消', 'Cancel')}</button>
+                <button type="button" data-action="confirm" class="tmd-trim-confirm">${label('转换为 GIF', 'Convert to GIF')}</button>
+            </div>`;
+            const video = dialog.querySelector('video');
+            const fields = Object.fromEntries(['start', 'end'].map(key => [key, dialog.querySelector(`[data-field="${key}"]`)]));
+            const timeline = dialog.querySelector('.tmd-trim-timeline');
+            const selection = dialog.querySelector('.tmd-trim-selection');
+            const handles = Object.fromEntries(['start', 'end', 'move'].map(key => [key, dialog.querySelector(`[data-drag="${key}"]`)]));
+            const playhead = dialog.querySelector('.tmd-trim-playhead');
+            const clock = dialog.querySelector('[data-current-time]');
+            const warning = dialog.querySelector('.tmd-trim-warning');
+            const confirm = dialog.querySelector('[data-action="confirm"]');
+            const preview = dialog.querySelector('[data-action="preview"]');
+            const summary = dialog.querySelector('output');
+            let settled = false;
+            let playingSelection = false;
+            let selected = { start: 0, end: Math.min(duration, maxSeconds) };
+            let drag = null;
+            const range = () => ({ start: selected.start, end: selected.end });
+            const valid = () => {
+                try {
+                    GifConverter.validateRange({ start: fields.start.valueAsNumber, end: fields.end.valueAsNumber }, duration, maxSeconds);
+                    GifConverter.validateRange(range(), duration, maxSeconds);
+                    return true;
+                }
+                catch { return false; }
+            };
+            const refresh = (message = '') => {
+                const ok = valid();
+                confirm.disabled = preview.disabled = !ok;
+                summary.textContent = label(`保留 ${(selected.end - selected.start).toFixed(2)} 秒 / ${maxSeconds} 秒`, `Keep ${(selected.end - selected.start).toFixed(2)}s / ${maxSeconds}s`);
+                warning.textContent = message || (ok ? '' : label('请输入有效的起止时间。', 'Enter valid start and end times.'));
+                timeline.classList.toggle('tmd-trim-at-limit', Boolean(message));
+                selection.style.left = `${selected.start / duration * 100}%`;
+                selection.style.width = `${(selected.end - selected.start) / duration * 100}%`;
+                for (const key of ['start', 'end']) handles[key].style.left = `${selected[key] / duration * 100}%`;
+                const bounds = {
+                    start: [Math.max(0, selected.end - maxSeconds), selected.end - 0.01, selected.start],
+                    end: [selected.start + 0.01, Math.min(duration, selected.start + maxSeconds), selected.end],
+                    move: [0, duration - (selected.end - selected.start), selected.start]
+                };
+                for (const [key, [min, max, now]] of Object.entries(bounds)) {
+                    handles[key].setAttribute('aria-valuemin', min.toFixed(2));
+                    handles[key].setAttribute('aria-valuemax', max.toFixed(2));
+                    handles[key].setAttribute('aria-valuenow', now.toFixed(2));
+                    handles[key].setAttribute('aria-valuetext', key === 'move'
+                        ? `${selected.start.toFixed(2)} – ${selected.end.toFixed(2)} ${label('秒', 'seconds')}`
+                        : `${now.toFixed(2)} ${label('秒', 'seconds')}`);
+                }
+            };
+            const seek = time => {
+                playingSelection = false;
+                video.pause();
+                video.currentTime = Math.max(0, Math.min(duration, time));
+                updatePlayhead();
+            };
+            const updatePlayhead = () => {
+                const time = Math.max(0, Math.min(duration, video.currentTime || 0));
+                playhead.style.left = `${time / duration * 100}%`;
+                clock.textContent = `${time.toFixed(2)} / ${duration.toFixed(2)} s`;
+            };
+            const apply = (part, value, base = selected) => {
+                const next = GifTrimRange.adjust(base, part, value, duration, maxSeconds);
+                selected = { start: next.start, end: next.end };
+                for (const key of ['start', 'end']) fields[key].value = Math.min(duration, Number(selected[key].toFixed(8)));
+                refresh(next.limited ? label(`最多保留 ${maxSeconds} 秒，已阻止继续扩大。可缩短片段或拖动中间整体移动。`, `Maximum ${maxSeconds}s reached. Shorten the selection or drag its center to move it.`) : '');
+                seek(part === 'end' ? selected.end : selected.start);
+            };
+            const finish = (value, error) => {
+                if (settled) return;
+                settled = true;
+                drag = null;
+                video.pause();
+                video.removeAttribute('src');
+                video.load();
+                dialog.close();
+                dialog.remove();
+                if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
+                if (error) reject(error); else resolve(value);
+            };
+            for (const key of ['start', 'end']) {
+                // Commit numeric changes on blur/Enter so clamping cannot interrupt typing.
+                fields[key].oninput = () => { video.pause(); playingSelection = false; refresh(); };
+                fields[key].onchange = () => {
+                    if (Number.isFinite(fields[key].valueAsNumber)) apply(key, fields[key].valueAsNumber);
+                };
+                fields[key].onkeydown = event => { if (event.key === 'Enter') { event.preventDefault(); fields[key].blur(); } };
+            }
+            timeline.onpointerdown = event => {
+                if (event.button !== 0 || drag) return;
+                const target = event.target.closest('[data-drag]');
+                const rect = timeline.getBoundingClientRect();
+                if (!target) { seek((event.clientX - rect.left) / rect.width * duration); return; }
+                event.preventDefault();
+                target.focus({ preventScroll: true });
+                video.pause();
+                playingSelection = false;
+                drag = { id: event.pointerId, part: target.dataset.drag, x: event.clientX, rect, base: range(), moved: false };
+                timeline.setPointerCapture(event.pointerId);
+            };
+            timeline.onpointermove = event => {
+                if (!drag || event.pointerId !== drag.id) return;
+                const pixels = event.clientX - drag.x;
+                if (!drag.moved && Math.abs(pixels) < 3) return;
+                drag.moved = true;
+                const delta = pixels / drag.rect.width * duration;
+                const initial = drag.part === 'end' ? drag.base.end : drag.base.start;
+                const time = Math.round((initial + delta) * 100) / 100;
+                apply(drag.part, time, drag.base);
+            };
+            timeline.onpointerup = event => {
+                if (!drag || event.pointerId !== drag.id) return;
+                if (!drag.moved && drag.part === 'move') seek((event.clientX - drag.rect.left) / drag.rect.width * duration);
+                drag = null;
+                timeline.releasePointerCapture(event.pointerId);
+            };
+            timeline.onpointercancel = timeline.onlostpointercapture = () => { drag = null; };
+            for (const [part, handle] of Object.entries(handles)) {
+                handle.onkeydown = event => {
+                    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+                    event.preventDefault();
+                    const current = part === 'end' ? selected.end : selected.start;
+                    const direction = ['ArrowRight', 'ArrowUp'].includes(event.key) ? 1 : -1;
+                    const value = event.key === 'Home' ? 0 : event.key === 'End' ? duration : current + direction * (event.shiftKey ? 1 : 0.1);
+                    apply(part, Math.round(value * 100) / 100);
+                };
+            }
+            preview.onclick = async () => {
+                if (!video.paused) { video.pause(); return; }
+                if (!valid()) return;
+                playingSelection = true;
+                video.currentTime = range().start;
+                try { await video.play(); }
+                catch { if (!settled) summary.textContent = label('无法播放预览，请重试。', 'Preview could not play. Please retry.'); }
+            };
+            video.ontimeupdate = () => {
+                updatePlayhead();
+                if (playingSelection && video.currentTime >= range().end) {
+                    video.pause();
+                    playingSelection = false;
+                    video.currentTime = range().end;
+                }
+            };
+            video.onseeking = video.onseeked = updatePlayhead;
+            video.onplay = () => { preview.textContent = label('暂停预览', 'Pause preview'); };
+            video.onpause = () => { preview.textContent = label('播放选中片段', 'Play selection'); };
+            video.onerror = () => { if (!settled) finish(null, new Error('GIF: preview decoding failed / 预览视频解码失败')); };
+            confirm.onclick = () => { if (valid()) finish(range()); };
+            dialog.querySelector('[data-action="cancel"]').onclick = () => finish(null);
+            dialog.oncancel = event => { event.preventDefault(); finish(null); };
+            dialog.onclose = () => finish(null);
+            document.body.appendChild(dialog);
+            try {
+                video.src = url;
+                video.muted = true;
+                refresh();
+                dialog.showModal();
+            } catch (error) { finish(null, error); }
+        });
     }
 
     renderHistoryUI() {
@@ -1998,8 +2662,8 @@ class UIManager {
 class TwitterMediaDownloaderApp {
     constructor() {
         this.storage = new StorageManager();
-        this.queue = new DownloadQueue();
         this.ui = new UIManager(this);
+        this.queue = new DownloadQueue(details => this.ui.chooseMediaSize(details));
         this.isTweetDeck = location.hostname.includes('tweetdeck');
     }
 
@@ -2098,8 +2762,6 @@ class TwitterMediaDownloaderApp {
             let error;
             if (!medias.length) {
                 error = 'No video to convert / 这条帖子没有可转换的普通视频';
-            } else if (medias.some(media => Number(media.video_info?.duration_millis) > 10000)) {
-                error = 'GIF: exceeds 10s conversion limit / 仅支持 10 秒以内的视频，请使用原下载按钮保存 MP4';
             }
             if (error) {
                 this.ui.setButtonStatus(btn, 'failed', error);
@@ -2111,7 +2773,9 @@ class TwitterMediaDownloaderApp {
         if (medias.length > 0) {
             let tasksLeft = medias.length;
             let hasFailed = false;
+            let hasCancelled = false;
             let totalBytes = 0;
+            let totalEstimated = false;
             let fetchSizePromises = [];
 
             const baseInfo = { ...info };
@@ -2123,7 +2787,7 @@ class TwitterMediaDownloaderApp {
                 const gifVariant = media.type === 'animated_gif' && media.video_info?.variants?.find(n => n.content_type === 'image/gif');
                 info.url = media.type === 'photo'
                     ? media.media_url_https + ':orig'
-                    : (gifVariant?.url || (mp4Variants.length > 0 ? mp4Variants.reduce((a, b) => (a.bitrate || 0) >= (b.bitrate || 0) ? a : b).url : (isGif ? null : media.video_info?.variants?.[0]?.url)));
+                    : (gifVariant?.url || (mp4Variants.length > 0 ? (isGif ? MediaSize.gifVariant(mp4Variants, GifConverter.maxSide) : mp4Variants.reduce((a, b) => (a.bitrate || 0) >= (b.bitrate || 0) ? a : b)).url : (isGif ? null : media.video_info?.variants?.[0]?.url)));
 
                 if (!info.url) {
                     hasFailed = true;
@@ -2133,7 +2797,8 @@ class TwitterMediaDownloaderApp {
                     return;
                 }
 
-                let sizePromise = isGif ? Promise.resolve() : fetch(info.url, { method: 'HEAD', signal: AbortSignal.timeout(15000) }).then(res => {
+                const hasVideoSizes = !isGif && media.type === 'video' && mp4Variants.length > 0;
+                let sizePromise = isGif || hasVideoSizes ? Promise.resolve() : fetch(info.url, { method: 'HEAD', signal: AbortSignal.timeout(15000) }).then(res => {
                     let cl = res.headers.get('content-length');
                     if (cl) totalBytes += parseInt(cl, 10);
                 }).catch(() => { });
@@ -2145,25 +2810,43 @@ class TwitterMediaDownloaderApp {
                 info['file-type'] = isGif ? 'gif' : media.type;
                 info.index = index ? index : allMedias.indexOf(media) + 1;
 
-                info.out = (out.replace(/\.?{file-ext}/, '') + ((medias.length > 1 || index) && !out.includes('{index}') && !out.includes('{file-name}') ? '-' + info.index : '') + '.{file-ext}')
-                    .replace(/{([^{}:]+)(:[^{}]+)?}/g, (_, name) => info[name] != null ? info[name] : '');
+                const makeFilename = fileInfo => (out.replace(/\.?{file-ext}/, '') + ((medias.length > 1 || index) && !out.includes('{index}') && !out.includes('{file-name}') ? '-' + fileInfo.index : '') + '.{file-ext}')
+                    .replace(/{([^{}:]+)(:[^{}]+)?}/g, (_, name) => fileInfo[name] != null ? fileInfo[name] : '');
+                info.out = makeFilename(info);
+                const chooseSize = details => this.ui.chooseMediaSize({ ...details, name: info.out });
 
                 this.queue.add({
                     url: info.url, name: info.out, gif: isGif,
-                    gifOptions: isVideoGif ? { maxSeconds: 10, requireVideo: true } : undefined,
+                    gifOptions: isGif ? {
+                        chooseSize,
+                        ...(isVideoGif ? { maxSeconds: 15, requireVideo: true,
+                            editRange: source => this.ui.editGifRange(source) } : {})
+                    } : undefined,
+                    videoOptions: hasVideoSizes ? {
+                        variants: mp4Variants, duration: Number(media.video_info?.duration_millis) / 1000, chooseSize,
+                        nameForUrl: url => {
+                            const file = url.split('/').pop().split(/[:?]/)[0];
+                            return makeFilename({ ...info, url, file, 'file-name': file.split('.')[0] });
+                        }
+                    } : undefined,
                     onprogress: text => {
                         if (!hasFailed) {
                             btn.dataset.tmdProgress = text;
                             btn.title = text;
                         }
                     },
-                    onload: async bytes => {
-                        if (isGif) totalBytes += bytes || 0;
+                    onload: async (bytes, estimated = false) => {
+                        if (isGif || hasVideoSizes) totalBytes += bytes || 0;
+                        totalEstimated ||= estimated;
                         if (--tasksLeft === 0 && !hasFailed) {
+                            if (hasCancelled) {
+                                this.ui.setButtonStatus(btn, 'download', 'Download cancelled / 已取消下载');
+                                return;
+                            }
                             this.ui.setButtonStatus(btn, 'completed', this.ui.lang.completed);
                             if (this.storage.saveHistoryFlag && !is_exist) {
                                 await Promise.all(fetchSizePromises);
-                                let sizeStr = totalBytes > 0 ? (totalBytes / (1024 * 1024)).toFixed(2) + ' MB' : 'Unknown';
+                                let sizeStr = totalBytes > 0 ? (totalEstimated ? '≈ ' : '') + (totalBytes / (1024 * 1024)).toFixed(2) + ' MB' : 'Unknown';
 
                                 await this.storage.addHistory({
                                     id: status_id,
@@ -2176,6 +2859,10 @@ class TwitterMediaDownloaderApp {
                                 this.ui.updateHistoryCount();
                             }
                         }
+                    },
+                    oncancel: () => {
+                        hasCancelled = true;
+                        if (--tasksLeft === 0 && !hasFailed) this.ui.setButtonStatus(btn, 'download', 'Download cancelled / 已取消下载');
                     },
                     onerror: error => {
                         hasFailed = true;
