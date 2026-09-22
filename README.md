@@ -55,28 +55,11 @@ This threshold opens the picker; it does not force the result below 10 MB.
 Native GIF variants are preserved byte for byte; the GIF presets apply to conversions
 from video. GIF source/output limits of 100 MiB still apply.
 
-## Upstream integration (0.3.8)
-
-Integrates upstream main (ee4091b) while retaining GIF conversion, trimming and size
-selection. Photo and MP4 sources are fetched through GM_xmlhttpRequest and saved
-using a local Blob link, as in upstream. Converted GIFs use the same save path after
-the size guard. Prepared bytes are reused on save retries; failed source requests
-are retried up to three times. Only the final failure is reported. History records
-the actual downloaded Blob size, replacing a preliminary MP4 estimate.
-
-Temporary links are removed after each attempt. Successful Blob URLs remain alive
-for 60 seconds so the browser can consume them; failed saves release them immediately.
-As with upstream, success means the browser download was initiated, not that the
-file was verified on disk. Browser download restrictions can still prevent saving.
-
-The upstream shortcut setting is disabled by default and can be enabled in Settings.
-The history button also retains upstream's compact layout above the mobile bottom bar.
-
 ## Download guard and conversion performance
 
 Version 0.3.7 independently checks the actual GIF blob at the download boundary.
 A result over 10 MiB without a size-choice receipt must show a picker before
-the browser download can start. If the picker callback is unavailable, the download fails
+GM_download can run. If the picker callback is unavailable, the download fails
 with a refresh/retry notice instead of silently saving the oversized file.
 Already reviewed results avoid a duplicate picker. The fallback retains the trim
 range when re-encoding a smaller preset. Native GIFs over 10 MiB require confirmation
@@ -99,7 +82,7 @@ The original missed-dialog event was not reproduced; the guard covers a skipped
 converter picker regardless of why it was skipped.
 
 After updating, refresh existing X tabs. Hover the GIF button to check that its
-running version is v0.3.8; updating the installed script alone does not reload code
+running version is v0.3.7; updating the installed script alone does not reload code
 already running in a tab.
 
 ## GIF downloads
@@ -174,6 +157,4 @@ Twitter/X page still needs manual verification after installation.
 
 0.3.7：增加下载前的实际 GIF 大小检查。超限且未经选档确认时必须弹窗，选择窗口不可用时停止下载。
 通过最多两个本地后台线程并行处理颜色、优先使用足够清晰的视频源加快转换；不降低现有分辨率、帧率或调色算法。
-更新后请刷新已打开的 X 网页，悬停“转 GIF”按钮可核对当前运行版本 v0.3.8。
-
-0.3.8：整合上游 Blob 下载、默认关闭的快捷键开关和移动端历史按钮适配，保留 GIF 裁剪与选档。下载记录使用实际文件大小；下载失败仅在重试结束后报告。
+更新后请刷新已打开的 X 网页，悬停“转 GIF”按钮可核对当前运行版本 v0.3.7。

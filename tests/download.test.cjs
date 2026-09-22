@@ -360,88 +360,32 @@ function assertGifAnimation(bytes, expectedFrames, expectedDuration) {
         } finally { delete sandbox.Worker; }
     });
     const savedConvert = GifConverter.convert;
-    let onSave = () => {};
-    const anchors = new Set(), cleanupJobs = [];
-    const createElement = sandbox.document.createElement;
-    sandbox.document.documentElement.appendChild = link => anchors.add(link);
-    sandbox.document.createElement = tag => tag === 'a' ? {
-        style: {},
-        click() { assert.ok(anchors.has(this)); onSave({ url: this.href, name: this.download }); },
-        remove() { anchors.delete(this); }
-    } : createElement(tag);
-    sandbox.setTimeout = (callback, ms, ...args) => ms === 60000
-        ? cleanupJobs.push(callback) : setTimeout(callback, ms, ...args);
-    sandbox.GM_download = () => assert.fail('Downloads must use the upstream Blob path');
     await check('download retries encode once and report success only once', async () => {
         let conversions = 0, attempts = 0, success = 0, failed = 0, downloadUrl;
         GifConverter.convert = async (url, progress, options) => { conversions++; assert.equal(options.maxSeconds, 15); return originalGif; };
-        onSave = o => { downloadUrl = o.url; attempts++; if (attempts < 3) throw new Error('temporary'); };
+        sandbox.GM_download = o => { downloadUrl = o.url; attempts++; if (attempts < 3) o.onerror(new Error('temporary')); else o.onload(); };
         await new DownloadQueue().start({ gif: true, gifOptions: { maxSeconds: 15 }, url: 'source.mp4', name: 'output.gif', onload: n => { success++; assert.equal(n, originalGif.size); }, onerror: () => failed++ });
         assert.equal(conversions, 1); assert.equal(attempts, 3); assert.equal(success, 1); assert.equal(failed, 0);
-        assert.deepEqual(Buffer.from(await (await fetch(downloadUrl)).arrayBuffer()), Buffer.from(await originalGif.arrayBuffer()));
-        assert.equal(anchors.size, 0);
-        cleanupJobs.splice(0).forEach(cleanup => cleanup());
-        await assert.rejects(fetch(downloadUrl)); // Released after allowing the browser to consume it.
+        await assert.rejects(fetch(downloadUrl)); // Object URL is released after download completes.
     });
     await check('conversion failure never falls back to an MP4 download', async () => {
         let downloads = 0, failures = 0;
         GifConverter.convert = async () => { throw new Error('decode failure'); };
-        onSave = () => downloads++;
+        sandbox.GM_download = () => downloads++;
         await new DownloadQueue().start({ gif: true, url: 'source.mp4', name: 'output.gif', onload: () => assert.fail(), onerror: () => failures++ });
         assert.equal(downloads, 0); assert.equal(failures, 1);
     });
-    await check('ordinary source fetch preserves URL; synchronous errors release the queue', async () => {
+    await check('ordinary downloads preserve URL; synchronous errors release the queue', async () => {
         let attempts = 0, failures = 0;
-        sandbox.GM_xmlhttpRequest = o => { assert.equal(o.url, 'plain.mp4'); attempts++; throw new Error('disabled'); };
+        sandbox.GM_download = o => { assert.equal(o.url, 'plain.mp4'); attempts++; throw new Error('disabled'); };
         const q = new DownloadQueue();
         await q.start({ url: 'plain.mp4', name: 'plain.mp4', onerror: () => failures++ });
         assert.equal(attempts, 3); assert.equal(failures, 1);
     });
-    await check('HTTP errors, invalid blobs, timeout and abort fail once after three attempts', async () => {
-        for (const respond of [
-            o => o.onload({ status: 403, response: new Blob(['denied']) }),
-            o => o.onload({ status: 200, response: 'not a blob' }),
-            o => o.ontimeout(new Error('timeout')),
-            o => o.onabort(new Error('aborted'))
-        ]) {
-            let requests = 0, failures = 0, saves = 0, successes = 0;
-            sandbox.GM_xmlhttpRequest = o => { requests++; queueMicrotask(() => respond(o)); };
-            onSave = () => saves++;
-            await new DownloadQueue().start({ url: 'broken.jpg', name: 'broken.jpg', onerror: () => failures++, onload: () => successes++ });
-            assert.equal(requests, 3); assert.equal(failures, 1); assert.equal(saves, 0); assert.equal(successes, 0);
-        }
-    });
-    await check('a transient fetch failure recovers with original bytes and actual history size', async () => {
-        let requests = 0, successes = 0, failures = 0, saved;
-        const original = new Blob(['original photo bytes'], { type: 'image/jpeg' });
-        sandbox.GM_xmlhttpRequest = o => {
-            assert.equal(o.method, 'GET'); assert.equal(o.responseType, 'blob');
-            assert.equal(o.url, 'photo.jpg');
-            if (++requests === 1) queueMicrotask(() => o.onerror(new Error('network')));
-            else queueMicrotask(() => o.onload({ status: 200, response: original }));
-        };
-        onSave = task => { saved = task; };
-        await new DownloadQueue().start({ url: 'photo.jpg', name: 'original.jpg',
-            onerror: () => failures++, onload: (bytes, estimated) => {
-                successes++; assert.equal(bytes, original.size); assert.equal(estimated, false);
-            }
-        });
-        assert.equal(requests, 2); assert.equal(successes, 1); assert.equal(failures, 0);
-        assert.equal(saved.name, 'original.jpg'); assert.match(saved.url, /^blob:/);
-        assert.equal(await (await fetch(saved.url)).text(), await original.text());
-    });
-    await check('failed browser saves remove anchors and release the prepared Blob immediately', async () => {
-        let requests = 0, failures = 0, saves = 0, savedUrl;
-        sandbox.GM_xmlhttpRequest = o => { requests++; o.onload({ status: 200, response: new Blob(['mp4']) }); };
-        onSave = task => { savedUrl = task.url; saves++; throw new Error('save blocked'); };
-        await new DownloadQueue().start({ url: 'video.mp4', name: 'video.mp4', onerror: () => failures++ });
-        assert.equal(requests, 1); assert.equal(failures, 1); assert.equal(saves, 3); assert.equal(anchors.size, 0);
-        await assert.rejects(fetch(savedUrl));
-    });
     await check('cancelled encoding invokes cancellation once and never downloads', async () => {
         let cancelled = 0;
         GifConverter.convert = async () => { throw Object.assign(new Error('cancelled'), { code: 'GIF_CANCELLED' }); };
-        onSave = () => assert.fail('Must not download after cancellation');
+        sandbox.GM_download = () => assert.fail('Must not download after cancellation');
         await new DownloadQueue().start({ gif: true, oncancel: () => cancelled++, onerror: () => assert.fail('Cancellation is not an error'), onload: () => assert.fail() });
         assert.equal(cancelled, 1);
     });
@@ -450,7 +394,7 @@ function assertGifAnimation(bytes, expectedFrames, expectedDuration) {
         let downloaded = 0, decisions = 0;
         const actual = new Blob([new Uint8Array(MediaSize.threshold + 1234)], {type:'image/gif'});
         GifConverter.convert = async () => actual;
-        onSave = () => { assert.equal(decisions, 1); downloaded++; };
+        sandbox.GM_download = task => { assert.equal(decisions, 1); downloaded++; task.onload(); };
         try {
             await new DownloadQueue(({choices}) => {
                 decisions++;
@@ -463,7 +407,7 @@ function assertGifAnimation(bytes, expectedFrames, expectedDuration) {
     await check('large unapproved GIF cannot download when its final picker is missing or cancelled', async () => {
         let failures = 0, cancelled = 0;
         GifConverter.convert = async () => new Blob([new Uint8Array(MediaSize.threshold + 1)], {type:'image/gif'});
-        onSave = () => assert.fail('Unapproved file must not download');
+        sandbox.GM_download = () => assert.fail('Unapproved file must not download');
         try {
             await new DownloadQueue().start({gif:true,onload:()=>assert.fail(),onerror:error=>{ failures++; assert.match(error.message,/selection unavailable/); }});
             await new DownloadQueue(()=>null).start({gif:true,onload:()=>assert.fail(),onerror:()=>assert.fail(),oncancel:()=>cancelled++});
@@ -474,7 +418,7 @@ function assertGifAnimation(bytes, expectedFrames, expectedDuration) {
         const approved = new Blob([new Uint8Array(MediaSize.threshold + 2)], {type:'image/gif'});
         MediaSize.approvedGifs.add(approved);
         GifConverter.convert = async () => approved;
-        onSave = () => {};
+        sandbox.GM_download = task => task.onload();
         try {
             await new DownloadQueue(()=>assert.fail('Duplicate picker')).start({gif:true,onload(){},onerror:error=>assert.fail(error.message)});
             const unapproved = new Blob([new Uint8Array(MediaSize.threshold + 3)], {type:'image/gif'});
@@ -526,32 +470,24 @@ function assertGifAnimation(bytes, expectedFrames, expectedDuration) {
         assert.match(MediaSize.format(unknown.bytes), /Unknown/);
     });
     await check('selected MP4 URL, filename and size are retained across download retries', async () => {
-        let dialogs = 0, attempts = 0, successes = 0, fetches = 0, savedUrl;
+        let dialogs = 0, attempts = 0, successes = 0;
         sandbox.fetch = async url => new Response(null, { headers: { 'content-length': url === 'large.mp4' ? '20971520' : '5242880' } });
-        sandbox.GM_xmlhttpRequest = task => {
-            fetches++;
-            assert.equal(task.url, 'small.mp4');
-            task.onload({ status: 200, response: new Blob([new Uint8Array(5242880)]) });
-        };
-        onSave = task => {
-            assert.match(task.url, /^blob:/); assert.equal(task.name, 'chosen-small.mp4');
-            if (savedUrl) assert.equal(task.url, savedUrl);
-            savedUrl = task.url;
-            if (++attempts === 1) throw new Error('Retry');
+        sandbox.GM_download = task => {
+            assert.equal(task.url, 'small.mp4'); assert.equal(task.name, 'chosen-small.mp4');
+            if (++attempts === 1) task.onerror(new Error('Retry')); else task.onload();
         };
         await new DownloadQueue().start({ url: 'large.mp4', name: 'large.mp4', videoOptions: {
             variants: [ { content_type: 'video/mp4', bitrate: 2, url: 'large.mp4' }, { content_type: 'video/mp4', bitrate: 1, url: 'small.mp4' } ],
             duration: 30, nameForUrl: url => 'chosen-' + url,
             chooseSize: ({ choices, kind }) => { dialogs++; assert.equal(kind, 'MP4'); assert.equal(choices.length, 2); return choices[1].id; }
         }, onload: (bytes, estimated) => { successes++; assert.equal(bytes, 5242880); assert.equal(estimated, false); }, onerror: error => assert.fail(error.message) });
-        assert.equal(dialogs, 1); assert.equal(attempts, 2); assert.equal(successes, 1); assert.equal(fetches, 1);
+        assert.equal(dialogs, 1); assert.equal(attempts, 2); assert.equal(successes, 1);
     });
     await check('10 MiB MP4 skips picker; over-limit cancellation prevents download', async () => {
         let downloads = 0, cancelled = 0;
         const videoOptions = { variants: [{ content_type: 'video/mp4', url: 'video.mp4', bitrate: 1 }], duration: 1, chooseSize: () => assert.fail('No picker at threshold') };
         sandbox.fetch = async () => new Response(null, { headers: { 'content-length': String(MediaSize.threshold) } });
-        sandbox.GM_xmlhttpRequest = task => task.onload({ status: 200, response: new Blob(['mp4']) });
-        onSave = () => { downloads++; };
+        sandbox.GM_download = task => { downloads++; task.onload(); };
         await new DownloadQueue().start({ videoOptions, onload() {}, onerror: error => assert.fail(error.message) });
         assert.equal(downloads, 1);
         sandbox.fetch = async () => new Response(null, { headers: { 'content-length': String(MediaSize.threshold + 1) } });
@@ -580,44 +516,5 @@ function assertGifAnimation(bytes, expectedFrames, expectedDuration) {
         assert.equal((await trim).start, 1);
         assert.deepEqual(opened, ['size', 'trim']);
     });
-    await check('upstream keyboard shortcut is disabled by default and persists explicit opt-in', async () => {
-        const values = new Map();
-        sandbox.GM_getValue = async (key, fallback) => values.has(key) ? values.get(key) : fallback;
-        sandbox.GM_setValue = async (key, value) => values.set(key, value);
-        const app = new TwitterMediaDownloaderApp();
-        await app.storage.init();
-        assert.equal(app.storage.shortcutEnabledFlag, false);
-        await app.storage.setSetting('shortcut_enabled', true);
-        const reloaded = new TwitterMediaDownloaderApp();
-        await reloaded.storage.init();
-        assert.equal(reloaded.storage.shortcutEnabledFlag, true);
-        await reloaded.storage.setSetting('shortcut_enabled', false);
-        assert.equal(values.get('shortcut_enabled'), false);
-    });
-    await check('shortcut handler respects opt-in and ignores text entry while enabled', async () => {
-        const oldDocument = sandbox.document;
-        const handlers = {};
-        let clicks = 0;
-        const button = { classList: { contains: () => false }, click: () => clicks++ };
-        const container = { querySelector: () => button };
-        sandbox.document = { documentElement: { lang: 'en' }, addEventListener: (name, handler) => { handlers[name] = handler; }, body: { contains: () => true } };
-        sandbox.window = { tmdHoveredContainer: container };
-        sandbox.MutationObserver = class { observe() {} };
-        try {
-            const app = new TwitterMediaDownloaderApp();
-            app.ui = { injectCSS() {}, renderHistoryUI() {} };
-            await app.init();
-            const event = { key: 'd', target: { tagName: 'DIV' }, preventDefault() {}, stopPropagation() {} };
-            handlers.keydown(event); assert.equal(clicks, 0);
-            await app.storage.setSetting('shortcut_enabled', true);
-            handlers.keydown(event); assert.equal(clicks, 1);
-            for (const target of [{ tagName: 'INPUT' }, { tagName: 'TEXTAREA' }, { tagName: 'DIV', isContentEditable: true }]) {
-                handlers.keydown({ ...event, target });
-            }
-            assert.equal(clicks, 1);
-        } finally { sandbox.document = oldDocument; delete sandbox.window; delete sandbox.MutationObserver; }
-    });
-    cleanupJobs.splice(0).forEach(cleanup => cleanup());
-    assert.equal(anchors.size, 0);
     console.log(`${passed} checks passed`);
 })().catch(error => { console.error(error); process.exitCode = 1; });
